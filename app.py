@@ -12,12 +12,14 @@ import unicodedata
 # 1. ペース解析・展開予想のコアロジック
 # ==========================================
 
-def calculate_early_pace_speed(row):
+def calculate_early_pace_speed(row, current_dist):
+    """ 前半3F(600m)のタイムから絶対スピード(m/s)を計算し、距離・馬場・コース補正をかける """
     if pd.isna(row.get('early_3f')):
         return np.nan
     
     raw_speed = 600.0 / row['early_3f']
     
+    # 1. 馬場状態による補正
     condition_mod = 0.0
     if row['track_type'] == "芝":
         if row['track_condition'] in ["重", "不良"]: condition_mod = +0.15 
@@ -26,12 +28,30 @@ def calculate_early_pace_speed(row):
         if row['track_condition'] in ["重", "不良"]: condition_mod = -0.15 
         elif row['track_condition'] == "稍": condition_mod = -0.05
 
+    # 2. 特殊コース・勾配による補正
     course_mod = 0.0
+    # 芝スタートダート
     turf_start_dirt = [("東京", 1600), ("中山", 1200), ("阪神", 1400), ("京都", 1400), ("新潟", 1200), ("中京", 1400)]
     if row['track_type'] == "ダート" and (row['venue'], row['distance']) in turf_start_dirt:
-        course_mod = -0.15 # 過去の芝スタート補正も少しマイルドに調整
+        course_mod += -0.15
+        
+    # 上り坂スタート (時計がかかる分を評価)
+    uphill_starts = [("中山", 2000, "芝"), ("阪神", 2000, "芝"), ("中京", 2000, "芝")]
+    if (row['venue'], row['distance'], row['track_type']) in uphill_starts:
+        course_mod += +0.15
 
-    return raw_speed + condition_mod + course_mod
+    # 下り坂スタート (時計が出やすい分を割引)
+    downhill_starts = [("京都", 1400, "芝"), ("京都", 1600, "芝"), ("新潟", 1000, "芝")]
+    if (row['venue'], row['distance'], row['track_type']) in downhill_starts:
+        course_mod += -0.15
+
+    # 3. 【NEW】距離差による補正
+    dist_diff = row['distance'] - current_dist
+    clipped_diff = max(-600, min(600, dist_diff))
+    # 100m差につき、秒速 0.08 m/s 分を補正（前走が短距離なら割引、長距離なら加点）
+    distance_mod = (clipped_diff / 100.0) * 0.08
+
+    return raw_speed + condition_mod + course_mod + distance_mod
 
 def extract_jockey_target_position(past_races_df: pd.DataFrame, current_venue: str) -> float:
     if past_races_df.empty: return 7.0 
@@ -57,7 +77,8 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
         horse['max_early_speed'] = 16.0
         return 7.0 
     
-    past_df['early_speed'] = past_df.apply(calculate_early_pace_speed, axis=1)
+    # 距離補正を適用するために current_dist を渡す
+    past_df['early_speed'] = past_df.apply(lambda row: calculate_early_pace_speed(row, current_dist), axis=1)
     max_speed = past_df['early_speed'].max()
     horse['max_early_speed'] = max_speed if not pd.isna(max_speed) else 16.0
     
@@ -74,7 +95,6 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     base_mod = (horse['horse_number'] - 1) * 0.05 
     outside_adv_courses = [("中山", 1200, "ダート"), ("東京", 1600, "ダート"), ("阪神", 1400, "ダート"), ("京都", 1400, "ダート")]
     if (current_venue, current_dist, current_track) in outside_adv_courses:
-        # 【修正】外枠有利の補正を弱める (最大0.75差 -> 最大0.30差へマイルド化)
         base_mod = (total_horses - horse['horse_number']) * 0.02 - 0.15
 
     late_start_penalty = 0.0
@@ -118,15 +138,12 @@ def format_formation(sorted_horses):
     return " ".join(parts)
 
 def generate_pace_and_spread_comment(sorted_horses, current_track):
-    """ スピード値とスコアの分散からペースと馬群の形状を推論する """
     if len(sorted_horses) < 3: return "データ不足"
     
     top_score = sorted_horses[0]['score']
     leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
     leader_nums = "、".join([chr(9311 + h['horse_number']) for h in leaders])
     
-    # 1. 隊列の形状（縦長か一団か）の判定
-    # 先頭から中団（全頭数の約6割の位置）までのスコアの開きを見る
     mid_idx = min(len(sorted_horses)-1, int(len(sorted_horses) * 0.6))
     spread_gap = sorted_horses[mid_idx]['score'] - top_score
     
@@ -140,7 +157,6 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
         spread_text = "【標準的な隊列】"
         spread_reason = "極端にばらけることもなく、標準的なペース配分になりそうです。"
         
-    # 2. ペース判定 (先頭集団の想定スピード)
     top3_speeds = [h.get('max_early_speed', 16.1) for h in leaders]
     avg_top_speed = sum(top3_speeds) / len(top3_speeds) if top3_speeds else 16.1
     
@@ -158,7 +174,6 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
     else:
         base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行争い。無理のないペース配分です。"
 
-    # 特記事項のリストアップ
     special_alerts = [chr(9311 + h['horse_number']) + " " + h['special_flag'] for h in sorted_horses if h.get('special_flag')]
     
     final_cmt = f"**{spread_text}**\n{spread_reason}\n\n**{base_cmt}**"
@@ -288,8 +303,8 @@ def fetch_real_data(race_id: str):
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (競馬ブック版)")
-st.markdown("前半3F実測値と出遅れ(maru)枠順判定。さらにペースと隊列(縦長/一団)の仮説を出力します。")
+st.title("🏇 AI競馬展開予想 (距離補正・完全版)")
+st.markdown("前走との距離差やコース勾配まで計算に入れた精緻なペース予想を出力します。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -351,7 +366,6 @@ if races_to_run:
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             formation_text = format_formation(sorted_horses)
             
-            # 【NEW】コメント生成ロジックの呼び出し
             pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
 
             st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
@@ -359,7 +373,6 @@ if races_to_run:
             st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
             st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
             
-            # ペース・馬群形状の出力
             st.markdown("---")
             st.write(pace_comment)
             
