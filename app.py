@@ -271,7 +271,7 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
 # ==========================================
 # 2. 競馬ブック スクレイピングロジック（キャッシュ化）
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_real_data(race_id: str):
     url = f"https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/{race_id}.html"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
