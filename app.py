@@ -45,11 +45,9 @@ def calculate_early_pace_speed(row, current_dist):
 
     return raw_speed + condition_mod + course_mod + distance_mod
 
-# 【NEW】戦法キャラクターの判定（控えOK か ハナ絶対 か）
 def determine_running_style(past_df: pd.DataFrame) -> str:
     if past_df.empty: return "不明"
     
-    # ユーザーのアイデアを実装：好走実績の定義（1着 OR (人気 > 着順 AND 着順 <= 5)）
     is_good_run = (past_df['finish_position'] == 1) | ((past_df['popularity'] > past_df['finish_position']) & (past_df['finish_position'] <= 5))
     good_runs = past_df[is_good_run]
     
@@ -57,11 +55,9 @@ def determine_running_style(past_df: pd.DataFrame) -> str:
         
     good_positions = good_runs['first_corner_pos'].tolist()
     
-    # 全ての好走が「1番手」なら逃げ一辺倒
     if all(pos == 1 for pos in good_positions):
         return "ハナ絶対"
         
-    # 2〜5番手での好走実績があれば、譲っても競馬ができる
     if any(2 <= pos <= 5 for pos in good_positions):
         return "控えOK"
         
@@ -134,6 +130,32 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     final_score = base_position + weight_modifier + base_mod + late_start_penalty
     return max(1.0, min(18.0, final_score))
 
+# 【NEW】全体を見渡して「ハナを諦める」馬を判定するシナジー処理
+def apply_give_up_synergy(horses):
+    for h in horses:
+        if h.get('running_style') == "ハナ絶対":
+            give_up = False
+            for other in horses:
+                if other['horse_number'] == h['horse_number']: continue
+                
+                diff = h['score'] - other['score']
+                # 1. 圧倒的なスピード負け（相手の方がスコアが1.0以上小さい＝速い）
+                if diff >= 1.0:
+                    give_up = True
+                    break
+                # 2. スピードは拮抗しているが、相手が内枠にいて前をカットされる
+                if 0 <= diff < 1.0 and other['horse_number'] < h['horse_number']:
+                    give_up = True
+                    break
+                    
+            if give_up:
+                # 諦めて控えるため、ポジションを強制的に下げる
+                h['score'] += 1.5 
+                h['special_flag'] = (h['special_flag'] + " 📉枠・スピード負けで逃げ諦め濃厚").strip()
+                h['running_style'] = "逃げ諦め" # ハイペース要因から除外
+                
+    return horses
+
 def format_formation(sorted_horses):
     if not sorted_horses: return ""
     leaders, chasers, mid, backs = [], [], [], []
@@ -153,7 +175,6 @@ def format_formation(sorted_horses):
     if backs: parts.append("".join(backs))
     return " ".join(parts)
 
-# 【NEW】キャラクター衝突ベースのペース判定
 def generate_pace_and_spread_comment(sorted_horses, current_track):
     if len(sorted_horses) < 3: return "データ不足"
     
@@ -179,12 +200,13 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
     high_pace_threshold = 16.7 if current_track == "芝" else 16.5
     slow_pace_threshold = 16.3 if current_track == "芝" else 16.1
 
-    # ユーザーアイデア：気性・戦法による判定
     must_lead_count = sum(1 for h in leaders if h.get('running_style') == "ハナ絶対")
     can_wait_count = sum(1 for h in leaders if h.get('running_style') == "控えOK")
 
-    if must_lead_count >= 2:
+    if must_lead_count >= 2 and avg_top_speed >= high_pace_threshold:
         base_cmt = f"🔥 ハイペース必至\n「何がなんでも逃げたい」馬が複数おり、{leader_nums}の激しい先行争いでテンは速くなりそうです。"
+    elif must_lead_count >= 2:
+        base_cmt = f"🏃 乱ペース想定\n絶対的なスピードは平凡ですが、{leader_nums}が意地でもハナを主張し合い、競り合いによる消耗戦になりそうです。"
     elif must_lead_count == 1 and avg_top_speed >= high_pace_threshold:
         base_cmt = f"🏃 ややハイペース想定\n逃げ主張馬がペースを作り、{leader_nums}が引っ張る淀みない流れになりそうです。"
     elif must_lead_count == 0 and can_wait_count >= 2:
@@ -333,8 +355,8 @@ def fetch_real_data(race_id: str):
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (気性×絶対スピード版)")
-st.markdown("前走までの「好走パターン」から各馬の戦法をプロファイリングし、リアルな隊列とペースを推測します。")
+st.title("🏇 AI競馬展開予想 (気性×枠順 逃げ諦め判定版)")
+st.markdown("「ハナ絶対」の馬でも、内に速い馬がいれば諦める騎手心理をシミュレートし、リアルなペース推測を行います。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -390,12 +412,16 @@ if races_to_run:
                 
             total_horses = len(horses)
             
+            # 1. 各馬のベーススコアを計算
             for horse in horses:
                 horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
                 
+            # 2. 全体の並びを見て「逃げを諦める」馬のスコアを補正
+            horses = apply_give_up_synergy(horses)
+            
+            # 3. 最終スコアでソートして隊列・コメントを生成
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             formation_text = format_formation(sorted_horses)
-            
             pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
 
             st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
