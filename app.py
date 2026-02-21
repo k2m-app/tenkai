@@ -158,7 +158,7 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
                 prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
                 horse['special_flag'] = (prefix + "🐎外枠リカバー警戒").strip()
 
-    # 追加実装：外枠（外から5頭くらい）の様子見・控えるロジック
+    # 外枠（外から5頭くらい）の様子見・控えるロジック
     is_outer_5 = horse['horse_number'] > (total_horses - 5)
     weight_diff = horse['current_weight'] - last_race['weight']
     
@@ -265,7 +265,6 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
     else:
         base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行しますが、無理のない標準的なペース配分になりそうです。"
 
-    # 特注ポイントはコメント欄から削除（詳細のDataFrameのみに出力）
     final_cmt = f"**{spread_text}**\n{spread_reason}\n\n**{base_cmt}**"
     return final_cmt
 
@@ -402,25 +401,17 @@ def fetch_real_data(race_id: str):
         return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
-# 3. スマホ対応UI & State管理
+# 3. スマホ対応UI
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-# セッションステートの初期化
-if 'run_inference' not in st.session_state:
-    st.session_state.run_inference = False
-if 'target_races' not in st.session_state:
-    st.session_state.target_races = []
-if 'base_race_id' not in st.session_state:
-    st.session_state.base_race_id = ""
-
-st.title("🏇 AI競馬展開予想 (プロフェッショナル微調整版)")
-st.markdown("過度なバイアスを排除し、各要素を「隠し味」として機能させる実戦的な隊列予想を行います。")
+st.title("🏇 AI競馬展開予想")
+st.markdown("実戦的な隊列予想を行います。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
     
-    st.markdown("[🔗 競馬ブック（中央）トップページはこちら](https://s.keibabook.co.jp/cyuou/top)")
+    st.markdown("[🔗 競馬ブックはこちら](https://s.keibabook.co.jp/cyuou/top)")
     base_url_input = st.text_input("🔗 競馬ブックの出馬表URLを貼り付け", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
     
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
@@ -438,28 +429,32 @@ with st.container(border=True):
     with col2:
         execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-# 実行トリガーの判定とStateへの保存 (10桁・12桁ID両対応に変更)
+# 実行トリガーの判定 (セッションステートを削除し、ボタン押下時のみ動作)
+run_inference = False
+target_races = []
+base_race_id = ""
+
 if execute_all_btn:
-    st.session_state.run_inference = True
-    st.session_state.target_races = list(range(1, 13))
+    run_inference = True
+    target_races = list(range(1, 13))
     match = re.search(r'\d{10,12}', base_url_input)
-    st.session_state.base_race_id = match.group()[:10] if match else ""
+    base_race_id = match.group()[:10] if match else ""
 elif execute_btn:
     if not selected_races:
         st.warning("レース番号を選択してください。")
     else:
-        st.session_state.run_inference = True
-        st.session_state.target_races = selected_races
+        run_inference = True
+        target_races = selected_races
         match = re.search(r'\d{10,12}', base_url_input)
-        st.session_state.base_race_id = match.group()[:10] if match else ""
+        base_race_id = match.group()[:10] if match else ""
 
-# Stateに基づいて推論・描画を実行
-if st.session_state.run_inference:
-    if not st.session_state.base_race_id:
+# 推論・描画を実行
+if run_inference:
+    if not base_race_id:
         st.error("有効な競馬ブックのレースIDが見つかりません。")
     else:
-        for race_num in sorted(st.session_state.target_races):
-            target_race_id = f"{st.session_state.base_race_id}{race_num:02d}"
+        for race_num in sorted(target_races):
+            target_race_id = f"{base_race_id}{race_num:02d}"
             
             st.markdown(f"### 🏁 {race_num}R")
             
