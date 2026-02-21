@@ -8,9 +8,11 @@ import re
 import traceback
 
 # ==========================================
-# 1. 展開予想のコアロジック
+# 1. 展開予想のコアロジック (超・専門家アップデート)
 # ==========================================
+
 def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
+    """成功体験バイアス（騎手心理＋同コース適性）"""
     if past_races_df.empty: return 7.0 
     is_success = (past_races_df['finish_position'] == 1) | (past_races_df['popularity'] > past_races_df['finish_position'])
     success_races = past_races_df[is_success]
@@ -24,30 +26,88 @@ def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
     else:
         return float(past_races_df['first_corner_pos'].mean())
 
-def calculate_pace_score(horse, current_dist):
+def get_frame_specific_base_position(past_df, current_horse_num, total_horses):
+    """【新機能】今回の枠（内・外）と同じ枠だった過去走のテンの速さを優先する"""
+    if past_df.empty: return 7.0
+    
+    is_current_inside = current_horse_num <= (total_horses / 2)
+    
+    def check_inside(row):
+        # 過去走も半分より内だったか判定
+        return row['past_horse_num'] <= (row['past_total_horses'] / 2)
+        
+    past_df['is_inside'] = past_df.apply(check_inside, axis=1)
+    same_frame_df = past_df[past_df['is_inside'] == is_current_inside]
+    
+    # 同じ枠条件の過去走が2走以上あればその中央値を採用（なければ全体の中央値）
+    if len(same_frame_df) >= 2:
+        return same_frame_df['first_corner_pos'].median()
+    else:
+        return past_df['first_corner_pos'].median()
+
+def get_frame_modifier(venue, dist, track_type, horse_num, total_horses):
+    """【新機能】コース形態による枠順バイアスの最適化"""
+    # 基本は外枠ほど不利 (+補正)
+    base_mod = (horse_num - 1) * 0.05 
+    
+    # 外枠有利な特殊コースの定義（芝スタートダートや千直）
+    outside_adv_courses = [
+        ("中山", 1200, "ダート"), ("東京", 1600, "ダート"),
+        ("阪神", 1400, "ダート"), ("京都", 1400, "ダート"),
+        ("新潟", 1000, "芝")
+    ]
+    
+    if (venue, dist, track_type) in outside_adv_courses:
+        # 外枠ほどマイナス補正（前に行きやすい）に反転
+        base_mod = (total_horses - horse_num) * 0.05 - 0.4
+        
+    return base_mod
+
+def calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses):
+    """各馬の1次ポジションスコアを算出"""
     past_df = pd.DataFrame(horse['past_races'])
     if past_df.empty: return 7.0 
     
-    # 【NEW】出遅れノイズカット：平均値(mean)ではなく中央値(median)を使用し、突発的な不利を無視する
-    recent_3_median = past_df.head(3)['first_corner_pos'].median()
+    # 枠順ごとの傾向(60%) + 騎手心理(40%)
+    frame_specific_median = get_frame_specific_base_position(past_df, horse['horse_number'], total_horses)
     jockey_target = extract_jockey_target_position(past_df)
-    base_position = (recent_3_median * 0.6) + (jockey_target * 0.4)
+    base_position = (frame_specific_median * 0.6) + (jockey_target * 0.4)
     
     last_race = past_df.iloc[0]
-    
-    # 【NEW】昇級戦ショック：前走1着馬は相手強化でペースが速くなり、相対的に前に行きにくくなるためペナルティを加算
     promotion_penalty = 1.0 if last_race['finish_position'] == 1 else 0.0
     
     dist_diff = last_race['distance'] - current_dist
     clipped_diff = max(-400, min(400, dist_diff))
     dist_modifier = (clipped_diff / 100.0) * 0.2 
+    
     weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.25
     local_modifier = -1.0 if last_race['is_local'] else 0.0
-    frame_modifier = (horse['horse_number'] - 1) * 0.05
     
-    # 全ファクターの合算
+    # 最適化された枠順補正
+    frame_modifier = get_frame_modifier(current_venue, current_dist, current_track, horse['horse_number'], total_horses)
+    
     final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier + promotion_penalty
     return max(1.0, min(18.0, final_score))
+
+def apply_position_synergy(horses):
+    """【新機能】内枠の逃げ馬による番手恩恵（スリップストリーム効果）"""
+    horses_sorted = sorted(horses, key=lambda x: x['horse_number'])
+    
+    for i in range(len(horses_sorted)):
+        current_score = horses_sorted[i]['score']
+        # 自身が「番手・好位（2.5〜6.0）」を狙う馬の場合
+        if 2.5 <= current_score <= 6.0:
+            # 1つ内、または2つ内の馬をチェック
+            inner_horses = horses_sorted[max(0, i-2):i]
+            for inner_h in inner_horses:
+                # 内側に明確な逃げ馬（スコア2.0以下）がいるか？
+                if inner_h['score'] <= 2.0:
+                    # 前に壁を作ってもらいつつスムーズに番手が取れる恩恵 (-0.8ボーナス)
+                    horses_sorted[i]['score'] -= 0.8
+                    horses_sorted[i]['synergy'] = "内枠逃げ馬の恩恵"
+                    break # 一度恩恵を受けたら抜ける
+                    
+    return horses_sorted
 
 def format_formation(sorted_horses):
     if not sorted_horses: return ""
@@ -76,10 +136,17 @@ def generate_short_comment(sorted_horses):
     leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
     leader_nums = "と".join([chr(9311 + h['horse_number']) for h in leaders])
     gap_to_second = sorted_horses[1]['score'] - top_score
-    if len(leaders) >= 3: return f"🔥 ハイペース\n{leader_nums}が激しくハナを主張し合い、テンは早くなりそう。縦長。"
-    elif len(leaders) == 2 and gap_to_second < 0.5: return f"🏃 平均ペース\n{leader_nums}が並んで先行争い。隊列はすんなり決まりそう。"
-    elif gap_to_second >= 1.5: return f"🐢 スローペース\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
-    else: return f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
+    
+    # シナジー効果を受けた馬がいるかチェック
+    synergy_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy')]
+    synergy_text = f"内枠の逃げ馬を利用して{synergy_horses[0]}が絶好の番手を取れそう。" if synergy_horses else ""
+
+    if len(leaders) >= 3: base_cmt = f"🔥 ハイペース\n{leader_nums}が激しくハナを主張し合い、テンは早くなりそう。縦長。"
+    elif len(leaders) == 2 and gap_to_second < 0.5: base_cmt = f"🏃 平均ペース\n{leader_nums}が並んで先行争い。隊列はすんなり決まりそう。"
+    elif gap_to_second >= 1.5: base_cmt = f"🐢 スローペース\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
+    else: base_cmt = f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
+    
+    return base_cmt + ("\n💡 " + synergy_text if synergy_text else "")
 
 # ==========================================
 # 2. スクレイピングロジック
@@ -92,17 +159,21 @@ def fetch_real_data(race_id: str):
         response.encoding = 'utf-8' 
         time.sleep(1) 
         soup = BeautifulSoup(response.text, 'html.parser')
-        if not soup.select_one('#denma_latest'): return None, 1600, "出馬表データが見つかりませんでした。"
+        if not soup.select_one('#denma_latest'): return None, 1600, "", "芝", "出馬表が見つかりません。"
         
         current_venue = ""
         venue_elem = soup.select_one('.hr-menuWhite__item--current .hr-menuWhite__text')
         if venue_elem: current_venue = venue_elem.text.strip()
             
         current_dist = 1600 
+        current_track = "芝"
         status_div = soup.select_one('.hr-predictRaceInfo__status')
         if status_div:
             dist_match = re.search(r'(\d{4})m', status_div.text)
             if dist_match: current_dist = int(dist_match.group(1))
+            
+            track_match = re.search(r'(芝|ダート|障害)', status_div.text)
+            if track_match: current_track = track_match.group(1)
 
         horses_data = []
         for tr_latest, tr_past in zip(soup.select('#denma_latest tbody tr'), soup.select('#denma_past tbody tr')):
@@ -132,6 +203,11 @@ def fetch_real_data(race_id: str):
                 distance = int(dist_match_past.group(1)) if dist_match_past else current_dist
                 is_local = any(loc in txt for loc in ["川崎", "大井", "船橋", "浦和", "門別", "盛岡", "水沢", "園田", "姫路", "高知", "佐賀", "名古屋", "笠松", "金沢", "帯広"])
                 
+                # 【追加】過去の馬番と頭数を取得
+                horse_num_match = re.search(r'(\d+)頭\s+(\d+)番', txt)
+                past_total_horses = int(horse_num_match.group(1)) if horse_num_match else 16
+                past_horse_num = int(horse_num_match.group(2)) if horse_num_match else 8
+
                 is_same_venue = False
                 date_spans = td.select('.hr-denma__date span')
                 if len(date_spans) >= 2 and current_venue and date_spans[1].text.strip() in current_venue: is_same_venue = True
@@ -143,16 +219,18 @@ def fetch_real_data(race_id: str):
                 past_races.append({
                     'finish_position': finish_pos, 'popularity': popularity,
                     'first_corner_pos': first_corner, 'distance': distance,
-                    'weight': past_weight, 'is_local': is_local, 'is_same_venue': is_same_venue
+                    'weight': past_weight, 'is_local': is_local, 'is_same_venue': is_same_venue,
+                    'past_total_horses': past_total_horses, 'past_horse_num': past_horse_num
                 })
             horses_data.append({
                 'horse_number': horse_num, 'horse_name': horse_name,
-                'current_weight': current_weight, 'past_races': past_races
+                'current_weight': current_weight, 'past_races': past_races,
+                'synergy': "" # 番手恩恵フラグ用
             })
-        if not horses_data: return None, current_dist, "馬柱データが見つかりません。"
-        return horses_data, current_dist, None
+        if not horses_data: return None, 1600, "", "芝", "データがありません。"
+        return horses_data, current_dist, current_venue, current_track, None
     except Exception as e:
-        return None, 1600, f"エラー: {e}\n{traceback.format_exc()}"
+        return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
 # 3. スマホ対応UI (UI修正)
@@ -160,25 +238,37 @@ def fetch_real_data(race_id: str):
 st.set_page_config(page_title="スマホで競馬展開予想", page_icon="🏇", layout="centered")
 
 st.title("🏇 AI競馬展開予想")
-st.markdown("スマホでURLをコピペして、サクッと隊列とペースを予測します。")
+st.markdown("枠順バイアス・隣接馬とのシナジーまで考慮するプロ仕様の隊列予測です。")
 
-# 入力エリアをカード風にまとめる
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
-    base_url_input = st.text_input("🔗 Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1", placeholder="ここにURLをペースト")
+    base_url_input = st.text_input("🔗 Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1")
     
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
-    # 確実な複数選択ができるmultiselectを採用
-    selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
+    
+    # === pillsデザインを維持しつつ、エラーを回避する安全設計 ===
+    try:
+        # 最新版Streamlitの複数選択pills
+        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R", selection_mode="multi")
+    except TypeError:
+        # 古いバージョンで multi 引数が使えない場合は単一選択pills
+        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=11, format_func=lambda x: f"{x}R")
 
-    # ボタンを横並びに配置（全レースボタン追加）
+    # 文字列や整数が1つだけ返ってきた場合、強制的にリストに変換してエラーを防ぐ
+    if not isinstance(selected_races, list):
+        if selected_races is None:
+            selected_races = []
+        else:
+            selected_races = [selected_races]
+
+    # 全レースボタンを横並びで配置
     col1, col2 = st.columns(2)
     with col1:
         execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True)
     with col2:
         execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-# どちらのボタンが押されたかで処理を分岐
+# 実行処理の分岐
 races_to_run = []
 if execute_all_btn:
     races_to_run = list(range(1, 13))
@@ -188,11 +278,10 @@ elif execute_btn:
         st.stop()
     races_to_run = selected_races
 
-# 実行処理ループ
 if races_to_run:
     match = re.search(r'\d{10}', base_url_input)
     if not match:
-        st.error("有効なYahoo!競馬のレースID(10桁)が見つかりません。")
+        st.error("有効なYahoo!競馬のレースIDが見つかりません。")
         st.stop()
         
     base_id = match.group()[:8] 
@@ -203,20 +292,26 @@ if races_to_run:
         st.markdown(f"### 🏁 {race_num}R")
         
         with st.spinner(f"{race_num}Rを解析中..."):
-            horses, current_dist, error_msg = fetch_real_data(target_race_id)
+            horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
             
             if error_msg:
-                st.warning(f"出馬表データがまだ確定していないか、取得できませんでした。")
+                st.warning("出馬表データがまだ確定していないか、取得できませんでした。")
                 continue
                 
+            total_horses = len(horses)
+            
+            # 1次スコア計算
             for horse in horses:
-                horse['score'] = calculate_pace_score(horse, current_dist)
+                horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
+            
+            # 2次スコア計算 (内枠逃げ馬による番手恩恵シナジー)
+            horses = apply_position_synergy(horses)
                 
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             formation_text = format_formation(sorted_horses)
             comment = generate_short_comment(sorted_horses)
 
-            st.info(f"📏 距離: **{current_dist}m**")
+            st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
             
             st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
             st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
@@ -229,7 +324,8 @@ if races_to_run:
                     "馬番": h['horse_number'],
                     "馬名": h['horse_name'],
                     "スコア": round(h['score'], 2),
-                    "斤量": h['current_weight']
+                    "斤量": h['current_weight'],
+                    "特記事項": h['synergy']
                 } for h in sorted_horses])
                 st.dataframe(df_result, use_container_width=True, hide_index=True)
                 
