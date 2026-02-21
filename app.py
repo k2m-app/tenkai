@@ -39,36 +39,64 @@ def calculate_pace_score(horse, current_dist):
         
     last_race = past_df.iloc[0]
     
-    # ① 距離変動の補正 (前走距離 - 今回距離) / 100 * 0.5
+    # ① 距離変動の補正
+    # 今回が前走より短ければ前を取りにくい(+補正)、前走より長ければ前を取りやすい(-補正)
     dist_diff = last_race['distance'] - current_dist
-    dist_modifier = -(dist_diff / 100) * 0.5 
+    dist_modifier = (dist_diff / 100.0) * 0.5 
     
-    # ② 斤量変動の補正 (今回斤量 - 前走斤量) * 0.5
+    # ② 斤量変動の補正
+    # 騎手の斤量が減るといつもより前にいきやすい(-補正)
     weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.5
     
-    # ③ 地方競馬補正 (前走が地方なら、中央では位置を下げやすい)
-    local_modifier = 2.0 if last_race['is_local'] else 0.0
+    # ③ 地方競馬補正
+    # 地方競馬場で走っているときは、いつもよりかなり前の位置を取りやすい(-補正)
+    local_modifier = -2.0 if last_race['is_local'] else 0.0
     
     final_score = base_position + dist_modifier + weight_modifier + local_modifier
     return max(1.0, min(18.0, final_score))
+
+def format_formation(sorted_horses):
+    """展開のフォーマット：(⑥⑧) ⑨④③②① ⑤⑦"""
+    leaders, chasers, mid, backs = [], [], [], []
+    for h in sorted_horses:
+        num_str = chr(9311 + h['horse_number'])
+        score = h['score']
+        if score <= 4.0: leaders.append(num_str)
+        elif score <= 8.0: chasers.append(num_str)
+        elif score <= 13.0: mid.append(num_str)
+        else: backs.append(num_str)
+        
+    if not leaders and sorted_horses:
+        leaders.append(chr(9311 + sorted_horses[0]['horse_number']))
+        if chasers and chasers[0] == leaders[0]:
+            chasers.pop(0)
+            
+    parts = []
+    if leaders: parts.append(f"({''.join(leaders)})")
+    if chasers: parts.append("".join(chasers))
+    if mid: parts.append("".join(mid))
+    if backs: parts.append("".join(backs))
+    return " ".join(parts)
 
 def generate_short_comment(sorted_horses):
     """展開順に基づく短評の自動生成"""
     if len(sorted_horses) < 2:
         return "出走馬データが不足しているため、展開予想を生成できません。"
         
-    leaders = sorted_horses[:2]
-    chasers = sorted_horses[2:6]
+    leaders = [h for h in sorted_horses if h['score'] <= 4.0]
+    if not leaders:
+        leaders = [sorted_horses[0]]
+        if len(sorted_horses) > 1 and sorted_horses[1]['score'] - sorted_horses[0]['score'] < 1.0:
+            leaders.append(sorted_horses[1])
+            
+    leader_nums = "と".join([chr(9311 + h['horse_number']) for h in leaders])
     
-    comment = f"ハナを主張するのはスコア最上位の{leaders[0]['horse_name']}か。"
-    if leaders[1]['score'] - leaders[0]['score'] < 1.0:
-        comment += f"{leaders[1]['horse_name']}も徹底先行の構えで、テンの入りは早くなりそう。"
+    if len(leaders) >= 3:
+        return f"ハイペース。{leader_nums}が激しく逃げを争う展開で、ペースは早くなりそう。"
+    elif len(leaders) == 2:
+        return f"平均ペース。{leader_nums}が逃げたがるがそれ以外は不在。"
     else:
-        comment += f"単騎逃げの形になりそうで、ペースは落ち着く可能性が高い。"
-        
-    if len(chasers) >= 2:
-        comment += f"好位には{chasers[0]['horse_name']}、{chasers[1]['horse_name']}あたりが続き、距離や斤量の恩恵を活かして前を伺う展開。"
-    return comment
+        return f"スローペース。{leader_nums}の単騎逃げの形になりそうで、ペースは落ち着く可能性が高い。"
 
 # ==========================================
 # 2. Yahoo!スポーツ競馬・BeautifulSoup解析ロジック
@@ -256,22 +284,15 @@ if st.sidebar.button("予想を実行する", type="primary"):
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             
             # 隊列テキストの生成
-            formation_groups = []
-            for i in range(0, len(sorted_horses), 4):
-                group = "".join([f"[{h['horse_number']}]" for h in sorted_horses[i:i+4]])
-                formation_groups.append(group)
-            
-            formation_text = " ◀(進行方向)  " + "  -  ".join(formation_groups)
+            formation_text = format_formation(sorted_horses)
             
             # 短評の生成
             comment = generate_short_comment(sorted_horses)
 
             # 結果の描画
-            st.success("隊列予想")
-            st.markdown(f"**{formation_text}**")
-            
-            st.write("**📝 展開短評**")
-            st.write(comment)
+            st.success("展開予想")
+            st.markdown(f"**展開：{formation_text}**")
+            st.markdown(f"**短評：{comment}**")
             
             with st.expander(f"{race_num}R 各馬のポジショニングスコア詳細"):
                 df_result = pd.DataFrame([{
