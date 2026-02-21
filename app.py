@@ -6,7 +6,9 @@ from bs4 import BeautifulSoup
 import time
 import re
 import traceback
-import unicodedata
+
+# JRA全10場
+JRA_VENUES = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"]
 
 # ==========================================
 # 1. ペース解析・展開予想のコアロジック
@@ -18,6 +20,10 @@ def calculate_early_pace_speed(row, current_dist):
     
     raw_speed = 600.0 / row['early_3f']
     
+    # 【NEW】地方競馬のテン時計はJRA基準では遅いため、スピード値を大幅に割引
+    if row['venue'] not in JRA_VENUES:
+        raw_speed -= 0.6
+
     condition_mod = 0.0
     if row['track_type'] == "芝":
         if row['track_condition'] in ["重", "不良"]: condition_mod = +0.15 
@@ -39,16 +45,22 @@ def calculate_early_pace_speed(row, current_dist):
     if (row['venue'], row['distance'], row['track_type']) in downhill_starts:
         course_mod += -0.15
 
+    # 【大改修】距離変更に対するスピード補正を現実に即して修正
     dist_diff = row['distance'] - current_dist
-    clipped_diff = max(-600, min(600, dist_diff))
-    distance_mod = (clipped_diff / 100.0) * 0.08
+    distance_mod = 0.0
+    if dist_diff > 0:
+        # 距離短縮: 長い距離の緩いペースに慣れており、追走に苦労するためマイナス補正
+        distance_mod = -(dist_diff / 100.0) * 0.15
+    elif dist_diff < 0:
+        # 距離延長: 短距離の速い時計をそのまま評価するとバグるため、現在距離のスケールに割引
+        distance_mod = -(abs(dist_diff) / 100.0) * 0.25
 
     return raw_speed + condition_mod + course_mod + distance_mod
 
 def determine_running_style(past_df: pd.DataFrame) -> str:
     if past_df.empty: return "不明"
     
-    is_good_run = (past_df['finish_position'] == 1) | ((past_df['popularity'] > past_df['finish_position']) & (past_df['finish_position'] <= 5))
+    is_good_run = (past_df['finish_position'] <= 3) | ((past_df['popularity'] > past_df['finish_position']) & (past_df['finish_position'] <= 5))
     good_runs = past_df[is_good_run]
     
     if good_runs.empty: return "不明"
@@ -64,9 +76,9 @@ def determine_running_style(past_df: pd.DataFrame) -> str:
     return "差し追込"
 
 def extract_jockey_target_position(past_races_df: pd.DataFrame, current_venue: str) -> float:
-    if past_races_df.empty: return 7.0 
+    if past_races_df.empty: return 9.5 
     
-    is_success = (past_races_df['finish_position'] == 1) | (past_races_df['popularity'] > past_races_df['finish_position'])
+    is_success = (past_races_df['finish_position'] <= 3) | (past_races_df['popularity'] > past_races_df['finish_position'])
     is_same_venue = past_races_df['venue'] == current_venue
     
     venue_success_races = past_races_df[is_success & is_same_venue]
@@ -82,13 +94,11 @@ def extract_jockey_target_position(past_races_df: pd.DataFrame, current_venue: s
 def calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses):
     past_df = pd.DataFrame(horse['past_races'])
     
-    # 【改善】新馬・データ不足馬のデフォルト位置を中団(10.0)に下げる
     if past_df.empty: 
         horse['condition_mod'] = 0.0
         horse['special_flag'] = "❓データ不足"
         horse['max_early_speed'] = 16.0
         horse['running_style'] = "不明"
-        # 枠順による微細な差異だけ残し、基本は後ろにする
         return 10.0 + ((horse['horse_number'] - 1) * 0.05) 
     
     horse['running_style'] = determine_running_style(past_df)
@@ -97,7 +107,6 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     max_speed = past_df['early_speed'].max()
     horse['max_early_speed'] = max_speed if not pd.isna(max_speed) else 16.0
     
-    # 【改善】短距離ダート（1200〜1400m）はテンのスピードの比重をさらに上げる
     speed_multiplier = 4.0 if (current_track == "ダート" and current_dist <= 1400) else 3.0
     speed_advantage = 0.0
     if not pd.isna(max_speed):
@@ -117,6 +126,23 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     late_start_penalty = 0.0
     horse['special_flag'] = ""
     
+    # 【NEW】前走が地方競馬の場合は追走に苦労するためペナルティ
+    if last_race['venue'] not in JRA_VENUES:
+        late_start_penalty += 2.5
+        horse['special_flag'] = "⚠️前走地方でJRAペース戸惑い懸念"
+
+    # 【NEW】距離延長 ＆ ハナ絶対ではない場合、騎手は折り合いを重視して控える
+    if last_race['distance'] < current_dist and horse['running_style'] != "ハナ絶対":
+        late_start_penalty += 2.0
+        prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+        horse['special_flag'] = (prefix + "🐎距離延長で折り合い重視の可能性").strip()
+
+    # 【NEW】距離短縮でテンが速くなることへの戸惑い
+    if last_race['distance'] > current_dist:
+        late_start_penalty += 1.0
+        prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+        horse['special_flag'] = (prefix + "🐢距離短縮で追走苦労懸念").strip()
+
     if last_race.get('is_late_start', False):
         late_start_penalty += 1.0 
         if last_race['first_corner_pos'] <= 5:
@@ -125,17 +151,19 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
             
             if is_past_outside and is_current_inside:
                 late_start_penalty += 2.5
-                horse['special_flag'] = "⚠️前走外枠リカバー→今回内枠で包まれ出遅れリスク"
+                prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+                horse['special_flag'] = (prefix + "⚠️前走外枠リカバー→内枠包まれリスク").strip()
             elif is_past_outside and not is_current_inside:
                 late_start_penalty -= 0.5
-                horse['special_flag'] = "🐎出遅れ癖ありも外枠からリカバー警戒"
+                prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+                horse['special_flag'] = (prefix + "🐎出遅れも外枠リカバー警戒").strip()
             elif not is_past_outside:
-                horse['special_flag'] = "🔥出遅れを内からリカバリーする鬼脚"
+                prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+                horse['special_flag'] = (prefix + "🔥出遅れをリカバリーする鬼脚").strip()
 
     final_score = base_position + weight_modifier + base_mod + late_start_penalty
     return max(1.0, min(18.0, final_score))
 
-# 【改善】コース条件を受け取り、外枠有利コースでのシナジーを適正化
 def apply_give_up_synergy(horses, current_venue, current_dist, current_track):
     outside_adv_courses = [("中山", 1200, "ダート"), ("東京", 1600, "ダート"), ("阪神", 1400, "ダート"), ("京都", 1400, "ダート")]
     is_outside_adv = (current_venue, current_dist, current_track) in outside_adv_courses
@@ -145,34 +173,28 @@ def apply_give_up_synergy(horses, current_venue, current_dist, current_track):
             give_up = False
             for other in horses:
                 if other['horse_number'] == h['horse_number']: continue
-                
                 diff = h['score'] - other['score']
                 
-                # 1. 圧倒的なスピード負け（相手の方がスコアが1.0以上小さい＝速い）
                 if diff >= 1.0:
                     give_up = True
                     break
                 
-                # 2. スピードは拮抗している場合
                 if 0 <= diff < 1.0:
                     if is_outside_adv:
-                        # 外枠有利コースの場合：自分が内枠で、相手が外枠なら包まれて控える
                         if other['horse_number'] > h['horse_number']:
                             give_up = True
                             break
                     else:
-                        # 通常コースの場合：相手が内枠なら前をカットされて控える
                         if other['horse_number'] < h['horse_number']:
                             give_up = True
                             break
                     
             if give_up:
-                # 控えるため、ポジションを強制的に下げる（外枠有利コースで自分が外枠なら少し強気に粘る）
                 penalty = 1.0 if (is_outside_adv and h['horse_number'] >= len(horses)/2) else 1.5
                 h['score'] += penalty 
                 prefix = h['special_flag'] + " " if h['special_flag'] else ""
                 h['special_flag'] = (prefix + "📉枠・スピード差により控える可能性大").strip()
-                h['running_style'] = "先行（控える）" # ハイペース要因から除外
+                h['running_style'] = "先行（控える）" 
                 
     return horses
 
@@ -338,7 +360,13 @@ def fetch_real_data(race_id: str):
                 if negahi_spans:
                     v_text = negahi_spans[0].text
                     venue_map = {"東":"東京", "中":"中山", "京":"京都", "阪":"阪神", "名":"中京", "新":"新潟", "福":"福島", "小":"小倉", "札":"札幌", "函":"函館"}
+                    # 地方競馬場も追加して正確に判定
+                    local_venue_map = {"盛":"盛岡", "水":"水沢", "浦":"浦和", "船":"船橋", "大":"大井", "川":"川崎", "金":"金沢", "笠":"笠松", "園":"園田", "姫":"姫路", "高":"高知", "佐":"佐賀"}
                     for v_key, v_val in venue_map.items():
+                        if v_key in v_text:
+                            p_venue = v_val
+                            break
+                    for v_key, v_val in local_venue_map.items():
                         if v_key in v_text:
                             p_venue = v_val
                             break
@@ -375,8 +403,8 @@ def fetch_real_data(race_id: str):
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (気性×枠順 逃げ諦め判定版)")
-st.markdown("「ハナ絶対」の馬でも、内に速い馬がいれば控える騎手心理をシミュレートし、リアルなペース推測を行います。")
+st.title("🏇 AI競馬展開予想 (距離補正・地方JRAレベル差考慮版)")
+st.markdown("距離変更時の騎手心理や、地方実績のレベル差までシミュレートして高精度な隊列予想を行います。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -385,9 +413,9 @@ with st.container(border=True):
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
     
     try:
-        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R", selection_mode="multi")
+        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[9, 10], format_func=lambda x: f"{x}R", selection_mode="multi")
     except TypeError:
-        selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
+        selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[9, 10], format_func=lambda x: f"{x}R")
 
     if not isinstance(selected_races, list):
         if selected_races is None:
@@ -432,14 +460,11 @@ if races_to_run:
                 
             total_horses = len(horses)
             
-            # 1. 各馬のベーススコアを計算
             for horse in horses:
                 horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
                 
-            # 2. 全体の並びを見て「控える」馬のスコアを補正 (引数を追加)
             horses = apply_give_up_synergy(horses, current_venue, current_dist, current_track)
             
-            # 3. 最終スコアでソートして隊列・コメントを生成
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             formation_text = format_formation(sorted_horses)
             pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
