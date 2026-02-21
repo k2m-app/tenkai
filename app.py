@@ -74,31 +74,23 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     if (current_venue, current_dist, current_track) in outside_adv_courses:
         base_mod = (total_horses - horse['horse_number']) * 0.05 - 0.4
 
-    # --------------------------------------------------------
-    # 【NEW】出遅れ(maru) ＆ 枠順によるリカバリー判定ロジック
-    # --------------------------------------------------------
+    # 出遅れ(maru) ＆ 枠順によるリカバリー判定ロジック
     late_start_penalty = 0.0
     horse['special_flag'] = ""
     
-    if last_race['is_late_start']:
-        # 基本的に出遅れ癖があるとみなし、テンのポジションを少し割り引く
+    if last_race.get('is_late_start', False):
         late_start_penalty += 1.0 
-        
-        # もし前走で出遅れたのに1角で5番手以内にいた場合（無理やりリカバーした）
         if last_race['first_corner_pos'] <= 5:
             is_past_outside = last_race['past_frame'] >= 5
-            is_current_inside = horse['horse_number'] <= (total_horses / 2) # 今回が馬群の半分より内か
+            is_current_inside = horse['horse_number'] <= (total_horses / 2) 
             
             if is_past_outside and is_current_inside:
-                # 前走は外枠だからリカバーできたが、今回は内枠なので包まれて致命傷になる可能性が高い
                 late_start_penalty += 2.5
                 horse['special_flag'] = "⚠️前走外枠リカバー→今回内枠で出遅れ致命傷リスク"
             elif is_past_outside and not is_current_inside:
-                # 今回も外枠なのでリカバーできるかもしれない（出遅れペナルティを軽減）
                 late_start_penalty -= 0.5
                 horse['special_flag'] = "🐎出遅れ癖ありも外枠からリカバー警戒"
             elif not is_past_outside:
-                # 内枠から出遅れてリカバーした馬は相当なダッシュ力。今回も警戒。
                 horse['special_flag'] = "🔥出遅れを内からリカバリーする鬼脚"
 
     final_score = base_position + weight_modifier + base_mod + late_start_penalty
@@ -132,11 +124,12 @@ def fetch_real_data(race_id: str):
     try:
         response = requests.get(url, headers=headers)
         response.encoding = 'utf-8' 
-        time.sleep(1) 
+        time.sleep(1) # サーバー負荷軽減のため必ず1秒待機
         soup = BeautifulSoup(response.text, 'html.parser')
         
         basyo_elem = soup.select_one('td.basyo')
-        current_venue = basyo_elem.text.strip() if basyo_elem else "東京"
+        current_venue = basyo_elem.text.strip() if basyo_elem else "不明"
+        if current_venue == "不明": return None, 1600, "", "芝", "出馬表データが見つかりません（未確定の可能性があります）。"
         
         kyori_elem = soup.select_one('span.kyori')
         course_elem = soup.select_one('span.course')
@@ -147,7 +140,7 @@ def fetch_real_data(race_id: str):
         horses_data = []
         trs = soup.select('table.noryoku tr[class^="js-umaban"]')
         if not trs:
-            return None, current_dist, current_venue, current_track, "出馬表データが見つかりません。"
+            return None, current_dist, current_venue, current_track, "出走馬データが見つかりません。"
 
         for tr in trs:
             umaban_elem = tr.select_one('td.umaban span')
@@ -180,7 +173,6 @@ def fetch_real_data(race_id: str):
                 early_3f_span = td.select_one('.uzenh3')
                 early_3f = float(early_3f_span.text.strip()) if early_3f_span else np.nan
                 
-                # 【NEW】位置取り数字と出遅れ（maru）の判定
                 tuka_imgs = td.select('.tuka img')
                 first_corner = 7
                 is_late_start = False
@@ -188,9 +180,8 @@ def fetch_real_data(race_id: str):
                     src = tuka_imgs[0].get('src', '')
                     m = re.search(r'(\d+)\.gif', src)
                     if m: first_corner = int(m.group(1))
-                    if 'maru' in src: is_late_start = True # 出遅れ判定
+                    if 'maru' in src: is_late_start = True 
                         
-                # 【NEW】過去の枠番の取得
                 umaban_span = td.select_one('.umaban')
                 past_frame = 4
                 if umaban_span:
@@ -241,56 +232,88 @@ def fetch_real_data(race_id: str):
         return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
-# 3. スマホ対応UI
+# 3. スマホ対応UI (複数レース選択・一括処理)
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (出遅れ×枠順リカバリー判定版)")
-st.markdown("競馬ブックの「maru（出遅れ）」画像と枠順の相性を解析し、内枠で包まれるリスクを自動判定します。")
+st.title("🏇 AI競馬展開予想 (競馬ブック版)")
+st.markdown("競馬ブックのURLから「前半3Fの実測値」と「出遅れ画像(maru)」を解析し、全レースの隊列予想を一括出力します。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
-    base_url_input = st.text_input("🔗 競馬ブックのレースURL", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
+    base_url_input = st.text_input("🔗 競馬ブックのレースURL (どれか1レースでOK)", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
     
+    st.markdown("**🎯 予想したいレースを選択（複数可）**")
+    
+    try:
+        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R", selection_mode="multi")
+    except TypeError:
+        selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
+
+    if not isinstance(selected_races, list):
+        if selected_races is None:
+            selected_races = []
+        else:
+            selected_races = [selected_races]
+
     col1, col2 = st.columns(2)
     with col1:
-        execute_btn = st.button("🚀 このレースを予想", type="primary", use_container_width=True)
+        execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True)
+    with col2:
+        execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-if execute_btn:
+races_to_run = []
+if execute_all_btn:
+    races_to_run = list(range(1, 13))
+elif execute_btn:
+    if not selected_races:
+        st.warning("レース番号を選択してください。")
+        st.stop()
+    races_to_run = selected_races
+
+if races_to_run:
+    # 競馬ブックのURLから12桁のレースIDを抽出 (例: 202601040703)
     match = re.search(r'\d{12}', base_url_input)
     if not match:
-        st.error("有効な競馬ブックのレースIDが見つかりません。")
+        st.error("有効な競馬ブックのレースID（12桁の数字）が見つかりません。")
         st.stop()
         
-    target_race_id = match.group()
+    # 先頭10桁をベースID（開催日・会場）として取得
+    base_id = match.group()[:10]
     
-    with st.spinner("競馬ブックのデータを解析中..."):
-        horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
+    for race_num in sorted(races_to_run):
+        # ベースIDの末尾にループしているレース番号(01〜12)を結合
+        target_race_id = f"{base_id}{race_num:02d}"
         
-        if error_msg:
-            st.warning(error_msg)
-            st.stop()
-            
-        total_horses = len(horses)
+        st.markdown(f"### 🏁 {race_num}R")
         
-        for horse in horses:
-            horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
+        with st.spinner(f"{race_num}R のデータを解析中..."):
+            horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
             
-        sorted_horses = sorted(horses, key=lambda x: x['score'])
-        formation_text = format_formation(sorted_horses)
+            if error_msg:
+                st.warning(f"{error_msg}")
+                continue
+                
+            total_horses = len(horses)
+            
+            for horse in horses:
+                horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
+                
+            sorted_horses = sorted(horses, key=lambda x: x['score'])
+            formation_text = format_formation(sorted_horses)
 
-        st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
-        
-        st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
-        st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        with st.expander("📊 詳細スコアと特記事項を見る"):
-            df_result = pd.DataFrame([{
-                "馬番": h['horse_number'],
-                "馬名": h['horse_name'],
-                "スコア": round(h['score'], 2),
-                "特記事項": h.get('special_flag', '')
-            } for h in sorted_horses])
-            st.dataframe(df_result, use_container_width=True, hide_index=True)
+            st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
+            
+            st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
+            
+            with st.expander(f"📊 {race_num}R の詳細スコアと特記事項を見る"):
+                df_result = pd.DataFrame([{
+                    "馬番": h['horse_number'],
+                    "馬名": h['horse_name'],
+                    "スコア": round(h['score'], 2),
+                    "特記事項": h.get('special_flag', '')
+                } for h in sorted_horses])
+                st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
