@@ -6,13 +6,13 @@ from bs4 import BeautifulSoup
 import time
 import re
 import traceback
+import unicodedata
 
 # ==========================================
 # 1. ペース解析・展開予想のコアロジック
 # ==========================================
 
 def calculate_early_pace_speed(row):
-    """ 前半3F(600m)のタイムから絶対スピード(m/s)を計算し、馬場・コース補正をかける """
     if pd.isna(row.get('early_3f')):
         return np.nan
     
@@ -29,7 +29,7 @@ def calculate_early_pace_speed(row):
     course_mod = 0.0
     turf_start_dirt = [("東京", 1600), ("中山", 1200), ("阪神", 1400), ("京都", 1400), ("新潟", 1200), ("中京", 1400)]
     if row['track_type'] == "ダート" and (row['venue'], row['distance']) in turf_start_dirt:
-        course_mod = -0.2
+        course_mod = -0.15 # 過去の芝スタート補正も少しマイルドに調整
 
     return raw_speed + condition_mod + course_mod
 
@@ -54,10 +54,12 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     if past_df.empty: 
         horse['condition_mod'] = 0.0
         horse['special_flag'] = ""
+        horse['max_early_speed'] = 16.0
         return 7.0 
     
     past_df['early_speed'] = past_df.apply(calculate_early_pace_speed, axis=1)
     max_speed = past_df['early_speed'].max()
+    horse['max_early_speed'] = max_speed if not pd.isna(max_speed) else 16.0
     
     speed_advantage = 0.0
     if not pd.isna(max_speed):
@@ -72,9 +74,9 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     base_mod = (horse['horse_number'] - 1) * 0.05 
     outside_adv_courses = [("中山", 1200, "ダート"), ("東京", 1600, "ダート"), ("阪神", 1400, "ダート"), ("京都", 1400, "ダート")]
     if (current_venue, current_dist, current_track) in outside_adv_courses:
-        base_mod = (total_horses - horse['horse_number']) * 0.05 - 0.4
+        # 【修正】外枠有利の補正を弱める (最大0.75差 -> 最大0.30差へマイルド化)
+        base_mod = (total_horses - horse['horse_number']) * 0.02 - 0.15
 
-    # 出遅れ(maru) ＆ 枠順によるリカバリー判定ロジック
     late_start_penalty = 0.0
     horse['special_flag'] = ""
     
@@ -86,7 +88,7 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
             
             if is_past_outside and is_current_inside:
                 late_start_penalty += 2.5
-                horse['special_flag'] = "⚠️前走外枠リカバー→今回内枠で出遅れ致命傷リスク"
+                horse['special_flag'] = "⚠️前走外枠リカバー→今回内枠で包まれ出遅れリスク"
             elif is_past_outside and not is_current_inside:
                 late_start_penalty -= 0.5
                 horse['special_flag'] = "🐎出遅れ癖ありも外枠からリカバー警戒"
@@ -115,6 +117,56 @@ def format_formation(sorted_horses):
     if backs: parts.append("".join(backs))
     return " ".join(parts)
 
+def generate_pace_and_spread_comment(sorted_horses, current_track):
+    """ スピード値とスコアの分散からペースと馬群の形状を推論する """
+    if len(sorted_horses) < 3: return "データ不足"
+    
+    top_score = sorted_horses[0]['score']
+    leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
+    leader_nums = "、".join([chr(9311 + h['horse_number']) for h in leaders])
+    
+    # 1. 隊列の形状（縦長か一団か）の判定
+    # 先頭から中団（全頭数の約6割の位置）までのスコアの開きを見る
+    mid_idx = min(len(sorted_horses)-1, int(len(sorted_horses) * 0.6))
+    spread_gap = sorted_horses[mid_idx]['score'] - top_score
+    
+    if spread_gap >= 5.0:
+        spread_text = "隊列は【縦長】"
+        spread_reason = "テンが速い馬と遅い馬のスピード差が激しく、ばらけた展開になりそうです。"
+    elif spread_gap <= 2.5:
+        spread_text = "馬群は【一団】"
+        spread_reason = "各馬の前半スピードが拮抗しており、密集した塊のまま進む展開が濃厚です。コース取り（枠順）の差が出やすくなります。"
+    else:
+        spread_text = "【標準的な隊列】"
+        spread_reason = "極端にばらけることもなく、標準的なペース配分になりそうです。"
+        
+    # 2. ペース判定 (先頭集団の想定スピード)
+    top3_speeds = [h.get('max_early_speed', 16.1) for h in leaders]
+    avg_top_speed = sum(top3_speeds) / len(top3_speeds) if top3_speeds else 16.1
+    
+    high_pace_threshold = 16.7 if current_track == "芝" else 16.5
+    slow_pace_threshold = 16.3 if current_track == "芝" else 16.1
+    
+    if len(leaders) >= 3 and avg_top_speed >= high_pace_threshold:
+        base_cmt = f"🔥 ハイペース想定\n{leader_nums}が激しくハナを主張。テンはかなり速くなりそうです。"
+    elif len(leaders) == 1 and avg_top_speed < slow_pace_threshold:
+        base_cmt = f"🐢 スローペース想定\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
+    elif avg_top_speed >= high_pace_threshold:
+        base_cmt = f"🏃 ややハイペース想定\n{leader_nums}が引っ張る流れ。先行争いは活発です。"
+    elif avg_top_speed < slow_pace_threshold:
+        base_cmt = f"🚶 ややスローペース想定\n{leader_nums}が主導権を握るが、激しく競りかける馬はおらず落ち着きそうです。"
+    else:
+        base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行争い。無理のないペース配分です。"
+
+    # 特記事項のリストアップ
+    special_alerts = [chr(9311 + h['horse_number']) + " " + h['special_flag'] for h in sorted_horses if h.get('special_flag')]
+    
+    final_cmt = f"**{spread_text}**\n{spread_reason}\n\n**{base_cmt}**"
+    if special_alerts:
+        final_cmt += "\n\n💡 **特注ポイント**\n・" + "\n・".join(special_alerts)
+        
+    return final_cmt
+
 # ==========================================
 # 2. 競馬ブック スクレイピングロジック
 # ==========================================
@@ -124,7 +176,7 @@ def fetch_real_data(race_id: str):
     try:
         response = requests.get(url, headers=headers)
         response.encoding = 'utf-8' 
-        time.sleep(1) # サーバー負荷軽減のため必ず1秒待機
+        time.sleep(1) 
         soup = BeautifulSoup(response.text, 'html.parser')
         
         basyo_elem = soup.select_one('td.basyo')
@@ -232,16 +284,16 @@ def fetch_real_data(race_id: str):
         return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
-# 3. スマホ対応UI (複数レース選択・一括処理)
+# 3. スマホ対応UI
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
 st.title("🏇 AI競馬展開予想 (競馬ブック版)")
-st.markdown("競馬ブックのURLから「前半3Fの実測値」と「出遅れ画像(maru)」を解析し、全レースの隊列予想を一括出力します。")
+st.markdown("前半3F実測値と出遅れ(maru)枠順判定。さらにペースと隊列(縦長/一団)の仮説を出力します。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
-    base_url_input = st.text_input("🔗 競馬ブックのレースURL (どれか1レースでOK)", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
+    base_url_input = st.text_input("🔗 競馬ブックのレースURL", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
     
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
     
@@ -272,17 +324,14 @@ elif execute_btn:
     races_to_run = selected_races
 
 if races_to_run:
-    # 競馬ブックのURLから12桁のレースIDを抽出 (例: 202601040703)
     match = re.search(r'\d{12}', base_url_input)
     if not match:
-        st.error("有効な競馬ブックのレースID（12桁の数字）が見つかりません。")
+        st.error("有効な競馬ブックのレースIDが見つかりません。")
         st.stop()
         
-    # 先頭10桁をベースID（開催日・会場）として取得
     base_id = match.group()[:10]
     
     for race_num in sorted(races_to_run):
-        # ベースIDの末尾にループしているレース番号(01〜12)を結合
         target_race_id = f"{base_id}{race_num:02d}"
         
         st.markdown(f"### 🏁 {race_num}R")
@@ -301,13 +350,20 @@ if races_to_run:
                 
             sorted_horses = sorted(horses, key=lambda x: x['score'])
             formation_text = format_formation(sorted_horses)
+            
+            # 【NEW】コメント生成ロジックの呼び出し
+            pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
 
             st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
             
             st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
             st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
             
-            with st.expander(f"📊 {race_num}R の詳細スコアと特記事項を見る"):
+            # ペース・馬群形状の出力
+            st.markdown("---")
+            st.write(pace_comment)
+            
+            with st.expander(f"📊 {race_num}R の詳細スコア"):
                 df_result = pd.DataFrame([{
                     "馬番": h['horse_number'],
                     "馬名": h['horse_name'],
