@@ -20,9 +20,9 @@ def calculate_early_pace_speed(row, current_dist):
     
     raw_speed = 600.0 / row['early_3f']
     
-    # 【NEW】地方競馬のテン時計はJRA基準では遅いため、スピード値を大幅に割引
+    # 地方競馬のテン時計割引（過剰にならないよう -0.3 に調整）
     if row['venue'] not in JRA_VENUES:
-        raw_speed -= 0.6
+        raw_speed -= 0.3
 
     condition_mod = 0.0
     if row['track_type'] == "芝":
@@ -45,15 +45,15 @@ def calculate_early_pace_speed(row, current_dist):
     if (row['venue'], row['distance'], row['track_type']) in downhill_starts:
         course_mod += -0.15
 
-    # 【大改修】距離変更に対するスピード補正を現実に即して修正
+    # 距離バイアスの「隠し味化」（極端な補正を緩和）
     dist_diff = row['distance'] - current_dist
     distance_mod = 0.0
     if dist_diff > 0:
-        # 距離短縮: 長い距離の緩いペースに慣れており、追走に苦労するためマイナス補正
-        distance_mod = -(dist_diff / 100.0) * 0.15
+        # 距離短縮: 追走苦労のマイナス補正をマイルドに (-0.05)
+        distance_mod = -(dist_diff / 100.0) * 0.05
     elif dist_diff < 0:
-        # 距離延長: 短距離の速い時計をそのまま評価するとバグるため、現在距離のスケールに割引
-        distance_mod = -(abs(dist_diff) / 100.0) * 0.25
+        # 距離延長: スピードの過大評価を防ぐ補正をマイルドに (-0.10)
+        distance_mod = -(abs(dist_diff) / 100.0) * 0.10
 
     return raw_speed + condition_mod + course_mod + distance_mod
 
@@ -126,22 +126,22 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     late_start_penalty = 0.0
     horse['special_flag'] = ""
     
-    # 【NEW】前走が地方競馬の場合は追走に苦労するためペナルティ
+    # 前走地方競馬ペナルティ（+2.5 → +1.0へ緩和）
     if last_race['venue'] not in JRA_VENUES:
-        late_start_penalty += 2.5
-        horse['special_flag'] = "⚠️前走地方でJRAペース戸惑い懸念"
-
-    # 【NEW】距離延長 ＆ ハナ絶対ではない場合、騎手は折り合いを重視して控える
-    if last_race['distance'] < current_dist and horse['running_style'] != "ハナ絶対":
-        late_start_penalty += 2.0
-        prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
-        horse['special_flag'] = (prefix + "🐎距離延長で折り合い重視の可能性").strip()
-
-    # 【NEW】距離短縮でテンが速くなることへの戸惑い
-    if last_race['distance'] > current_dist:
         late_start_penalty += 1.0
+        horse['special_flag'] = "⚠️前走地方"
+
+    # 距離延長（過剰なペナルティを撤廃し、+0.5の微調整に）
+    if last_race['distance'] < current_dist and horse['running_style'] != "ハナ絶対":
+        late_start_penalty += 0.5
         prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
-        horse['special_flag'] = (prefix + "🐢距離短縮で追走苦労懸念").strip()
+        horse['special_flag'] = (prefix + "🐎距離延長(控える可能性)").strip()
+
+    # 距離短縮（過剰なペナルティを撤廃し、+0.3の微調整に）
+    if last_race['distance'] > current_dist:
+        late_start_penalty += 0.3
+        prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+        horse['special_flag'] = (prefix + "🐢距離短縮(追走注意)").strip()
 
     if last_race.get('is_late_start', False):
         late_start_penalty += 1.0 
@@ -150,16 +150,13 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
             is_current_inside = horse['horse_number'] <= (total_horses / 2) 
             
             if is_past_outside and is_current_inside:
-                late_start_penalty += 2.5
+                late_start_penalty += 1.5
                 prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
-                horse['special_flag'] = (prefix + "⚠️前走外枠リカバー→内枠包まれリスク").strip()
+                horse['special_flag'] = (prefix + "⚠️内枠包まれ懸念").strip()
             elif is_past_outside and not is_current_inside:
                 late_start_penalty -= 0.5
                 prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
-                horse['special_flag'] = (prefix + "🐎出遅れも外枠リカバー警戒").strip()
-            elif not is_past_outside:
-                prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
-                horse['special_flag'] = (prefix + "🔥出遅れをリカバリーする鬼脚").strip()
+                horse['special_flag'] = (prefix + "🐎外枠リカバー警戒").strip()
 
     final_score = base_position + weight_modifier + base_mod + late_start_penalty
     return max(1.0, min(18.0, final_score))
@@ -193,7 +190,7 @@ def apply_give_up_synergy(horses, current_venue, current_dist, current_track):
                 penalty = 1.0 if (is_outside_adv and h['horse_number'] >= len(horses)/2) else 1.5
                 h['score'] += penalty 
                 prefix = h['special_flag'] + " " if h['special_flag'] else ""
-                h['special_flag'] = (prefix + "📉枠・スピード差により控える可能性大").strip()
+                h['special_flag'] = (prefix + "📉枠差・控える可能性").strip()
                 h['running_style'] = "先行（控える）" 
                 
     return horses
@@ -258,17 +255,14 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
     else:
         base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行しますが、無理のない標準的なペース配分になりそうです。"
 
-    special_alerts = [chr(9311 + h['horse_number']) + " " + h['special_flag'] for h in sorted_horses if h.get('special_flag')]
-    
+    # 特注ポイントはコメント欄から削除（詳細のDataFrameのみに出力）
     final_cmt = f"**{spread_text}**\n{spread_reason}\n\n**{base_cmt}**"
-    if special_alerts:
-        final_cmt += "\n\n💡 **特注ポイント**\n・" + "\n・".join(special_alerts)
-        
     return final_cmt
 
 # ==========================================
-# 2. 競馬ブック スクレイピングロジック
+# 2. 競馬ブック スクレイピングロジック（キャッシュ化）
 # ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_data(race_id: str):
     url = f"https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/{race_id}.html"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -360,7 +354,6 @@ def fetch_real_data(race_id: str):
                 if negahi_spans:
                     v_text = negahi_spans[0].text
                     venue_map = {"東":"東京", "中":"中山", "京":"京都", "阪":"阪神", "名":"中京", "新":"新潟", "福":"福島", "小":"小倉", "札":"札幌", "函":"函館"}
-                    # 地方競馬場も追加して正確に判定
                     local_venue_map = {"盛":"盛岡", "水":"水沢", "浦":"浦和", "船":"船橋", "大":"大井", "川":"川崎", "金":"金沢", "笠":"笠松", "園":"園田", "姫":"姫路", "高":"高知", "佐":"佐賀"}
                     for v_key, v_val in venue_map.items():
                         if v_key in v_text:
@@ -399,29 +392,36 @@ def fetch_real_data(race_id: str):
         return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
-# 3. スマホ対応UI
+# 3. スマホ対応UI & State管理
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (距離補正・地方JRAレベル差考慮版)")
-st.markdown("距離変更時の騎手心理や、地方実績のレベル差までシミュレートして高精度な隊列予想を行います。")
+# セッションステートの初期化（ブラウザ操作で結果が消えないようにするため）
+if 'run_inference' not in st.session_state:
+    st.session_state.run_inference = False
+if 'target_races' not in st.session_state:
+    st.session_state.target_races = []
+if 'base_race_id' not in st.session_state:
+    st.session_state.base_race_id = ""
+
+st.title("🏇 AI競馬展開予想 (プロフェッショナル微調整版)")
+st.markdown("過度なバイアスを排除し、各要素を「隠し味」として機能させる実戦的な隊列予想を行います。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
-    base_url_input = st.text_input("🔗 競馬ブックのレースURL", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
+    
+    # URL入力の前にリンクを配置
+    st.markdown("[🔗 競馬ブック（中央）トップページはこちら](https://s.keibabook.co.jp/cyuou/top)")
+    base_url_input = st.text_input("🔗 競馬ブックの出馬表URLを貼り付け", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
     
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
-    
     try:
         selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[9, 10], format_func=lambda x: f"{x}R", selection_mode="multi")
     except TypeError:
         selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[9, 10], format_func=lambda x: f"{x}R")
 
     if not isinstance(selected_races, list):
-        if selected_races is None:
-            selected_races = []
-        else:
-            selected_races = [selected_races]
+        selected_races = [selected_races] if selected_races else []
 
     col1, col2 = st.columns(2)
     with col1:
@@ -429,62 +429,65 @@ with st.container(border=True):
     with col2:
         execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-races_to_run = []
+# 実行トリガーの判定とStateへの保存
 if execute_all_btn:
-    races_to_run = list(range(1, 13))
+    st.session_state.run_inference = True
+    st.session_state.target_races = list(range(1, 13))
+    match = re.search(r'\d{12}', base_url_input)
+    st.session_state.base_race_id = match.group()[:10] if match else ""
 elif execute_btn:
     if not selected_races:
         st.warning("レース番号を選択してください。")
-        st.stop()
-    races_to_run = selected_races
+    else:
+        st.session_state.run_inference = True
+        st.session_state.target_races = selected_races
+        match = re.search(r'\d{12}', base_url_input)
+        st.session_state.base_race_id = match.group()[:10] if match else ""
 
-if races_to_run:
-    match = re.search(r'\d{12}', base_url_input)
-    if not match:
+# Stateに基づいて推論・描画を実行
+if st.session_state.run_inference:
+    if not st.session_state.base_race_id:
         st.error("有効な競馬ブックのレースIDが見つかりません。")
-        st.stop()
-        
-    base_id = match.group()[:10]
-    
-    for race_num in sorted(races_to_run):
-        target_race_id = f"{base_id}{race_num:02d}"
-        
-        st.markdown(f"### 🏁 {race_num}R")
-        
-        with st.spinner(f"{race_num}R のデータを解析中..."):
-            horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
+    else:
+        for race_num in sorted(st.session_state.target_races):
+            target_race_id = f"{st.session_state.base_race_id}{race_num:02d}"
             
-            if error_msg:
-                st.warning(f"{error_msg}")
-                continue
+            st.markdown(f"### 🏁 {race_num}R")
+            
+            with st.spinner(f"{race_num}R のデータを解析中..."):
+                horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
                 
-            total_horses = len(horses)
-            
-            for horse in horses:
-                horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
+                if error_msg:
+                    st.warning(f"{error_msg}")
+                    continue
+                    
+                total_horses = len(horses)
                 
-            horses = apply_give_up_synergy(horses, current_venue, current_dist, current_track)
-            
-            sorted_horses = sorted(horses, key=lambda x: x['score'])
-            formation_text = format_formation(sorted_horses)
-            pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
+                for horse in horses:
+                    horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
+                    
+                horses = apply_give_up_synergy(horses, current_venue, current_dist, current_track)
+                
+                sorted_horses = sorted(horses, key=lambda x: x['score'])
+                formation_text = format_formation(sorted_horses)
+                pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
 
-            st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
-            
-            st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
-            st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
-            
-            st.markdown("---")
-            st.write(pace_comment)
-            
-            with st.expander(f"📊 {race_num}R の詳細データを見る"):
-                df_result = pd.DataFrame([{
-                    "馬番": h['horse_number'],
-                    "馬名": h['horse_name'],
-                    "スコア": round(h['score'], 2),
-                    "戦法": h.get('running_style', ''),
-                    "特記事項": h.get('special_flag', '')
-                } for h in sorted_horses])
-                st.dataframe(df_result, use_container_width=True, hide_index=True)
-            
-            st.markdown("<br>", unsafe_allow_html=True)
+                st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
+                
+                st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
+                st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
+                
+                st.markdown("---")
+                st.write(pace_comment)
+                
+                with st.expander(f"📊 {race_num}R の詳細データを見る"):
+                    df_result = pd.DataFrame([{
+                        "馬番": h['horse_number'],
+                        "馬名": h['horse_name'],
+                        "スコア": round(h['score'], 2),
+                        "戦法": h.get('running_style', ''),
+                        "特記事項": h.get('special_flag', '')
+                    } for h in sorted_horses])
+                    st.dataframe(df_result, use_container_width=True, hide_index=True)
+                
+                st.markdown("<br>", unsafe_allow_html=True)
