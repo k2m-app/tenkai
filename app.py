@@ -8,11 +8,10 @@ import re
 import traceback
 
 # ==========================================
-# 1. 展開予想のコアロジック (超・専門家アップデート)
+# 1. 展開予想のコアロジック
 # ==========================================
 
 def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
-    """成功体験バイアス（騎手心理＋同コース適性）"""
     if past_races_df.empty: return 7.0 
     is_success = (past_races_df['finish_position'] == 1) | (past_races_df['popularity'] > past_races_df['finish_position'])
     success_races = past_races_df[is_success]
@@ -27,14 +26,10 @@ def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
         return float(past_races_df['first_corner_pos'].mean())
 
 def get_frame_specific_base_position(past_df, current_horse_num, total_horses):
-    """今回の枠（内・外）と同じ枠だった過去走のテンの速さを優先する"""
     if past_df.empty: return 7.0
-    
     is_current_inside = current_horse_num <= (total_horses / 2)
-    
     def check_inside(row):
         return row['past_horse_num'] <= (row['past_total_horses'] / 2)
-        
     past_df['is_inside'] = past_df.apply(check_inside, axis=1)
     same_frame_df = past_df[past_df['is_inside'] == is_current_inside]
     
@@ -44,49 +39,40 @@ def get_frame_specific_base_position(past_df, current_horse_num, total_horses):
         return past_df['first_corner_pos'].median()
 
 def get_frame_modifier(venue, dist, track_type, horse_num, total_horses):
-    """コース形態による枠順バイアスの最適化"""
     base_mod = (horse_num - 1) * 0.05 
-    
     outside_adv_courses = [
         ("中山", 1200, "ダート"), ("東京", 1600, "ダート"),
         ("阪神", 1400, "ダート"), ("京都", 1400, "ダート"),
         ("新潟", 1000, "芝")
     ]
-    
     if (venue, dist, track_type) in outside_adv_courses:
         base_mod = (total_horses - horse_num) * 0.05 - 0.4
-        
     return base_mod
 
 def check_escape_only_horse(past_df: pd.DataFrame) -> bool:
-    """【新機能】JRAで逃げた時だけ馬券に絡む（番手だとダメな）不器用な馬か判定"""
+    """【改修】逃げ専用機の判定（直近の逃げ能力も加味する）"""
     if past_df.empty: return False
-    
-    # 地方交流戦は小回りで逃げ残りやすいため除外し、JRAのレースのみで判断
     jra_df = past_df[~past_df['is_local']]
     if jra_df.empty: return False
     
     escape_races = jra_df[jra_df['first_corner_pos'] == 1]
     non_escape_races = jra_df[jra_df['first_corner_pos'] > 1]
     
-    # 逃げた経験がないなら対象外
     if escape_races.empty: return False 
-        
-    # 逃げた時に3着以内に入ったことがあるか
     escape_success = (escape_races['finish_position'] <= 3).any()
     if not escape_success: return False
-        
-    # 逃げられなかった時（番手以下）に馬券に絡んだ（3着以内）ことがあるか？
-    # あれば「控えても大丈夫な馬」なので逃げ専用機からは除外
     if not non_escape_races.empty:
         non_escape_success = (non_escape_races['finish_position'] <= 3).any()
         if non_escape_success: return False 
             
-    # 「逃げて好走した」かつ「控えて好走したことがない」馬
+    # 【NEW】直近3走以内に「逃げた（1番手）」実績がないと、今はもう逃げる力がないと判断して弾く
+    recent_3_jra = jra_df.head(3)
+    if not (recent_3_jra['first_corner_pos'] == 1).any():
+        return False
+        
     return True
 
 def calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses):
-    """各馬の1次ポジションスコアを算出"""
     past_df = pd.DataFrame(horse['past_races'])
     if past_df.empty: 
         horse['condition_mod'] = 0.0
@@ -103,34 +89,47 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     dist_diff = last_race['distance'] - current_dist
     clipped_diff = max(-400, min(400, dist_diff))
     dist_modifier = (clipped_diff / 100.0) * 0.2 
-    
     weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.25
     local_modifier = -1.0 if last_race['is_local'] else 0.0
     frame_modifier = get_frame_modifier(current_venue, current_dist, current_track, horse['horse_number'], total_horses)
     
-    # 【改修】近走調子バイアス（穴馬を残すため、6着以下でもペナルティはなし）
     recent_3_races = past_df.head(3)
     if (recent_3_races['finish_position'] <= 5).any():
-        condition_modifier = -0.5 # 好調：1つくらい位置取りが上がる
+        condition_modifier = -0.5 
     else:
-        condition_modifier = 0.0  # 不調でもペナルティなし
+        condition_modifier = 0.0  
     horse['condition_mod'] = condition_modifier 
     
-    # 【NEW】逃げ専用機バイアス（ハナ絶対宣言）
+    # 【改修】逃げ専用機のスコア影響をマイルドに(-1.5)
     is_escape_only = check_escape_only_horse(past_df)
-    escape_modifier = -2.5 if is_escape_only else 0.0
+    escape_modifier = -1.5 if is_escape_only else 0.0
     horse['special_flag'] = "🔥逃げ専用(ハナ絶対)" if is_escape_only else ""
 
     final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier + promotion_penalty + condition_modifier + escape_modifier
     return max(1.0, min(18.0, final_score))
 
 def apply_position_synergy(horses):
-    """内枠の逃げ馬による番手恩恵（スリップストリーム効果）"""
+    """【改修】隣接枠の競り合いと、内枠逃げ馬の恩恵"""
     horses_sorted = sorted(horses, key=lambda x: x['horse_number'])
     
+    # 1. 同型隣接の競り合い判定 (馬番の差が2以内にある逃げ・先行馬)
+    for i in range(len(horses_sorted)):
+        h1 = horses_sorted[i]
+        if h1['score'] <= 3.5: 
+            for j in range(i+1, min(i+3, len(horses_sorted))):
+                h2 = horses_sorted[j]
+                if h2['score'] <= 3.5:
+                    # 競り合い発生！両者のスコアを下げて前傾姿勢に
+                    h1['score'] -= 0.5
+                    h2['score'] -= 0.5
+                    h1['synergy'] = "隣接枠と先行争い"
+                    h2['synergy'] = "隣接枠と先行争い"
+    
+    # 2. 内枠逃げ馬の恩恵
     for i in range(len(horses_sorted)):
         current_score = horses_sorted[i]['score']
-        if 2.5 <= current_score <= 6.0:
+        # 競り合いフラグが立っていない馬にのみ適用
+        if 2.5 <= current_score <= 6.0 and not horses_sorted[i]['synergy']:
             inner_horses = horses_sorted[max(0, i-2):i]
             for inner_h in inner_horses:
                 if inner_h['score'] <= 2.0:
@@ -162,26 +161,43 @@ def format_formation(sorted_horses):
     return " ".join(parts)
 
 def generate_short_comment(sorted_horses):
+    """【改修】逃げ専用機の単騎逃げや、競り合い状況を加味した短評"""
     if len(sorted_horses) < 2: return "データ不足"
+    
     top_score = sorted_horses[0]['score']
     leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
     leader_nums = "と".join([chr(9311 + h['horse_number']) for h in leaders])
-    gap_to_second = sorted_horses[1]['score'] - top_score
+    gap_to_second = sorted_horses[1]['score'] - top_score if len(sorted_horses) > 1 else 10.0
     
-    synergy_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy')]
+    synergy_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy') == "内枠逃げ馬の恩恵"]
     synergy_text = f"内枠の逃げ馬を利用して{synergy_horses[0]}が絶好の番手を取れそう。" if synergy_horses else ""
     
-    escape_only_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('special_flag')]
-    escape_text = f"何としてもハナを切りたい{escape_only_horses[0]}がペースを引き上げる。" if escape_only_horses else ""
+    conflict_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy') == "隣接枠と先行争い"]
+    conflict_text = f"隣接する{conflict_horses[0]}と{conflict_horses[1]}が競り合い、テンのペースは早くなる。" if len(conflict_horses) >= 2 else ""
 
-    if len(leaders) >= 3: base_cmt = f"🔥 ハイペース\n{leader_nums}が激しくハナを主張し合い、テンは早くなりそう。縦長。"
-    elif len(leaders) == 2 and gap_to_second < 0.5: base_cmt = f"🏃 平均ペース\n{leader_nums}が並んで先行争い。隊列はすんなり決まりそう。"
-    elif gap_to_second >= 1.5: base_cmt = f"🐢 スローペース\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
-    else: base_cmt = f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
+    escape_only_horses = [h for h in sorted_horses if h.get('special_flag')]
+    
+    # 逃げ専用機が1頭だけで、かつトップを走れる形の場合（他馬が譲る）
+    if escape_only_horses and len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']:
+        base_cmt = f"🐢 スローペース\n逃げ専用の{chr(9311 + escape_only_horses[0]['horse_number'])}がハナを主張。他馬は無理に競りかけず隊列はすんなり決まりそう。"
+    elif len(leaders) >= 3: 
+        base_cmt = f"🔥 ハイペース\n{leader_nums}が激しくハナを主張し合い、テンは早くなりそう。縦長。"
+    elif len(leaders) == 2 and gap_to_second < 0.5: 
+        base_cmt = f"🏃 平均ペース\n{leader_nums}が並んで先行争い。"
+    elif gap_to_second >= 1.5: 
+        base_cmt = f"🐢 スローペース\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
+    else: 
+        base_cmt = f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
     
     final_cmt = base_cmt
-    if escape_text: final_cmt += "\n⚠️ " + escape_text
+    if conflict_text: final_cmt += "\n⚔️ " + conflict_text
     if synergy_text: final_cmt += "\n💡 " + synergy_text
+    
+    # 逃げ専用が複数いたり、競り合いになりそうな場合のアラート
+    if escape_only_horses and not (len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']):
+        escape_nums = "、".join([chr(9311 + h['horse_number']) for h in escape_only_horses])
+        final_cmt += f"\n⚠️ 何としてもハナを切りたい{escape_nums}の出方次第でさらにペースが上がる可能性も。"
+        
     return final_cmt
 
 # ==========================================
@@ -273,7 +289,7 @@ def fetch_real_data(race_id: str):
 st.set_page_config(page_title="スマホで競馬展開予想", page_icon="🏇", layout="centered")
 
 st.title("🏇 AI競馬展開予想")
-st.markdown("枠順バイアス・調子・隣接馬とのシナジーまで考慮するプロ仕様の隊列予測です。")
+st.markdown("枠順バイアス・調子・隣接馬の競り合いシナジーまで考慮するプロ仕様の隊列予測です。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -329,11 +345,10 @@ if races_to_run:
                 
             total_horses = len(horses)
             
-            # 1次スコア計算
             for horse in horses:
                 horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
             
-            # 2次スコア計算 (内枠逃げ馬による番手恩恵シナジー)
+            # 隣接枠の競り合いシナジー適用
             horses = apply_position_synergy(horses)
                 
             sorted_horses = sorted(horses, key=lambda x: x['score'])
