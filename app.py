@@ -1,3 +1,12 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+import time
+import re
+import traceback
+
 # ==========================================
 # 1. 展開予想のコアロジック
 # ==========================================
@@ -105,94 +114,99 @@ def fetch_real_data(race_id: str):
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 今回のレース距離を抽出 (ページ内のテキストから "芝1600m" や "ダ1400m" を探す)
+        # 出馬表テーブルが存在するか確認 (左側の固定テーブル)
+        if not soup.select_one('#denma_latest'):
+            return None, 1600, "出馬表データが見つかりませんでした。URLが間違っているか、出馬表が未確定です。"
+        
+        # レース距離を抽出
         current_dist = 1600 
-        page_text = soup.get_text()
-        dist_match = re.search(r'(?:芝|ダ|障)\s*(\d{4})m', page_text)
-        if dist_match:
-            current_dist = int(dist_match.group(1))
+        status_div = soup.select_one('.hr-predictRaceInfo__status')
+        if status_div:
+            dist_match = re.search(r'(\d{4})m', status_div.text)
+            if dist_match:
+                current_dist = int(dist_match.group(1))
 
         horses_data = []
         
-        # Yahoo競馬の馬柱は <tr> 単位で構成されているため、行ごとにパース
-        for tr in soup.find_all('tr'):
-            tds = tr.find_all(['td', 'th'])
-            if len(tds) < 5: continue
-                
-            row_text = tr.get_text(separator=' ', strip=True)
-            
-            # 馬名抽出（hrefにhorseが含まれるリンクを探す）
-            a_tags = tr.find_all('a')
-            horse_name = ""
-            for a in a_tags:
-                if 'horse' in a.get('href', ''):
-                    horse_name = a.text.strip()
-                    break
-            if not horse_name: continue
-            
-            # 馬番抽出
-            horse_num = None
-            for td in tds[:5]:
-                txt = td.text.strip()
-                if txt.isdigit() and 1 <= int(txt) <= 18:
-                    horse_num = int(txt) 
-            if horse_num is None: continue
-                
-            # 今回斤量抽出
+        # Yahoo競馬の馬柱は左列（馬番など）と右列（過去走など）で別テーブルになっているため、zipで同時に回す
+        latest_trs = soup.select('#denma_latest tbody tr')
+        past_trs = soup.select('#denma_past tbody tr')
+
+        for tr_latest, tr_past in zip(latest_trs, past_trs):
+            # ===== 左側テーブルからの情報抽出 =====
+            # 馬番
+            num_elem = tr_latest.select_one('.hr-denma__number')
+            if not num_elem: continue
+            horse_num = int(num_elem.text.strip())
+
+            # 馬名
+            name_elem = tr_latest.select_one('.hr-denma__horse a')
+            horse_name = name_elem.text.strip() if name_elem else "不明"
+
+            # ===== 右側テーブルからの情報抽出 =====
+            # 今回斤量 (hr-tableScroll__data--name の最後のpタグに入っている 例: 56.5)
+            info_td = tr_past.select_one('.hr-tableScroll__data--name')
             current_weight = 55.0
-            weight_match = re.search(r'(?:5[0-9]|6[0-3]|4[8-9])\.\d', row_text)
-            if weight_match:
-                current_weight = float(weight_match.group())
+            if info_td:
+                p_tags = info_td.find_all('p')
+                if p_tags:
+                    try:
+                        current_weight = float(p_tags[-1].text.strip())
+                    except ValueError:
+                        pass
 
             past_races = []
-            
-            # 過去走データは文字数が多いtd（着順や距離が含まれる）に集約されている
-            potential_past_tds = [td for td in tds if len(td.text.strip()) > 15 and ("着" in td.text or "人" in td.text or "m" in td.text)]
-            if not potential_past_tds:
-                potential_past_tds = tds[-5:]
+            past_tds = tr_past.select('.hr-tableScroll__data--race')
 
-            for td in potential_past_tds[:5]:
-                txt = td.text.strip()
-                if len(txt) < 10: continue 
+            for td in past_tds:
+                # 着順
+                arr_elem = td.select_one('.hr-denma__arrival')
+                if not arr_elem:
+                    continue # 着順が無い場合は未出走や取消などなのでスキップ
                     
                 try:
-                    # 着順 (例: "1着" や文頭の数字)
-                    finish_match = re.search(r'(\d+)着', txt)
-                    if not finish_match:
-                        finish_match = re.search(r'^(\d{1,2})\b', txt)
-                    if not finish_match: continue
-                    finish_pos = int(finish_match.group(1))
+                    finish_pos = int(re.search(r'\d+', arr_elem.text).group())
+                except:
+                    continue # 「中止」などの文字列エラー回避
 
-                    # 人気 (例: "3人")
-                    pop_match = re.search(r'(\d+)人', txt)
-                    popularity = int(pop_match.group(1)) if pop_match else 7
+                txt = td.text
 
-                    # コーナー通過順 (例: "2-2-1" の最初の数字)
-                    corner_match = re.search(r'(\d+)-\d+', txt)
-                    first_corner = int(corner_match.group(1)) if corner_match else 7
+                # 人気 (例: 2人気)
+                pop_match = re.search(r'\((\d+)人気\)', txt)
+                popularity = int(pop_match.group(1)) if pop_match else 7
 
-                    # 距離
-                    dist_match_past = re.search(r'(?:芝|ダ|障)(\d+)m?', txt)
-                    distance = int(dist_match_past.group(1)) if dist_match_past else current_dist
+                # コーナー通過順 (例: 03-03-03-03 の最初の数字)
+                pass_elem = td.select_one('.hr-denma__passing')
+                first_corner = 7
+                if pass_elem:
+                    p_match = re.search(r'^(\d+)', pass_elem.text.strip())
+                    if p_match:
+                        first_corner = int(p_match.group(1))
 
-                    # 地方競馬判定
-                    is_local = any(loc in txt for loc in ["川崎", "大井", "船橋", "浦和", "門別", "盛岡", "水沢", "園田", "姫路", "高知", "佐賀", "名古屋", "笠松", "金沢", "帯広"])
+                # 距離
+                dist_match_past = re.search(r'(\d{4})m', txt)
+                distance = int(dist_match_past.group(1)) if dist_match_past else current_dist
 
-                    # 過去斤量
-                    weight_matches = re.findall(r'(?:5[0-9]|6[0-3]|4[8-9])\.\d', txt)
-                    past_weight = float(weight_matches[-1]) if weight_matches else current_weight
+                # 地方競馬判定
+                is_local = any(loc in txt for loc in ["川崎", "大井", "船橋", "浦和", "門別", "盛岡", "水沢", "園田", "姫路", "高知", "佐賀", "名古屋", "笠松", "金沢", "帯広"])
 
-                    past_races.append({
-                        'finish_position': finish_pos,
-                        'popularity': popularity,
-                        'first_corner_pos': first_corner,
-                        'distance': distance,
-                        'weight': past_weight,
-                        'is_local': is_local
-                    })
-                except Exception:
-                    pass 
-            
+                # 過去斤量 (例: 太宰 啓介(56.5))
+                past_j_elem = td.select_one('.hr-denma__jockey')
+                past_weight = current_weight
+                if past_j_elem:
+                    w_match = re.search(r'\((\d{2}(?:\.\d)?)\)', past_j_elem.text)
+                    if w_match:
+                        past_weight = float(w_match.group(1))
+
+                past_races.append({
+                    'finish_position': finish_pos,
+                    'popularity': popularity,
+                    'first_corner_pos': first_corner,
+                    'distance': distance,
+                    'weight': past_weight,
+                    'is_local': is_local
+                })
+
             horses_data.append({
                 'horse_number': horse_num,
                 'horse_name': horse_name,
@@ -200,9 +214,8 @@ def fetch_real_data(race_id: str):
                 'past_races': past_races
             })
 
-        # データが正しく取得できたかの判定
         if not horses_data:
-            return None, current_dist, "馬柱データが見つかりませんでした。URLが間違っているか、出馬表が未確定です。"
+            return None, current_dist, "馬柱データが見つかりませんでした。出馬表が未確定です。"
             
         return horses_data, current_dist, None
 
