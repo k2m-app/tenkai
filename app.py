@@ -158,6 +158,16 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
                 prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
                 horse['special_flag'] = (prefix + "🐎外枠リカバー警戒").strip()
 
+    # 追加実装：外枠（外から5頭くらい）の様子見・控えるロジック
+    is_outer_5 = horse['horse_number'] > (total_horses - 5)
+    weight_diff = horse['current_weight'] - last_race['weight']
+    
+    # 馬体重が2kg以上減っていない（= 大幅減量で勝負気配、ではない）かつ、絶対に逃げたい馬ではない場合
+    if is_outer_5 and weight_diff > -2.0 and horse['running_style'] != "ハナ絶対":
+        late_start_penalty += 0.7  # 様子見で位置を下げるペナルティ加算
+        prefix = horse['special_flag'] + " " if horse['special_flag'] else ""
+        horse['special_flag'] = (prefix + "👁️外枠様子見(控える)").strip()
+
     final_score = base_position + weight_modifier + base_mod + late_start_penalty
     return max(1.0, min(18.0, final_score))
 
@@ -396,7 +406,7 @@ def fetch_real_data(race_id: str):
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-# セッションステートの初期化（ブラウザ操作で結果が消えないようにするため）
+# セッションステートの初期化
 if 'run_inference' not in st.session_state:
     st.session_state.run_inference = False
 if 'target_races' not in st.session_state:
@@ -410,7 +420,6 @@ st.markdown("過度なバイアスを排除し、各要素を「隠し味」と�
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
     
-    # URL入力の前にリンクを配置
     st.markdown("[🔗 競馬ブック（中央）トップページはこちら](https://s.keibabook.co.jp/cyuou/top)")
     base_url_input = st.text_input("🔗 競馬ブックの出馬表URLを貼り付け", value="https://s.keibabook.co.jp/cyuou/nouryoku_html_detail/202601040703.html")
     
@@ -429,11 +438,11 @@ with st.container(border=True):
     with col2:
         execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-# 実行トリガーの判定とStateへの保存
+# 実行トリガーの判定とStateへの保存 (10桁・12桁ID両対応に変更)
 if execute_all_btn:
     st.session_state.run_inference = True
     st.session_state.target_races = list(range(1, 13))
-    match = re.search(r'\d{12}', base_url_input)
+    match = re.search(r'\d{10,12}', base_url_input)
     st.session_state.base_race_id = match.group()[:10] if match else ""
 elif execute_btn:
     if not selected_races:
@@ -441,7 +450,7 @@ elif execute_btn:
     else:
         st.session_state.run_inference = True
         st.session_state.target_races = selected_races
-        match = re.search(r'\d{12}', base_url_input)
+        match = re.search(r'\d{10,12}', base_url_input)
         st.session_state.base_race_id = match.group()[:10] if match else ""
 
 # Stateに基づいて推論・描画を実行
@@ -472,22 +481,22 @@ if st.session_state.run_inference:
                 formation_text = format_formation(sorted_horses)
                 pace_comment = generate_pace_and_spread_comment(sorted_horses, current_track)
 
-                st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
-                
-                st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
-                st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
-                
-                st.markdown("---")
-                st.write(pace_comment)
-                
-                with st.expander(f"📊 {race_num}R の詳細データを見る"):
-                    df_result = pd.DataFrame([{
-                        "馬番": h['horse_number'],
-                        "馬名": h['horse_name'],
-                        "スコア": round(h['score'], 2),
-                        "戦法": h.get('running_style', ''),
-                        "特記事項": h.get('special_flag', '')
-                    } for h in sorted_horses])
-                    st.dataframe(df_result, use_container_width=True, hide_index=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
+            st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
+            
+            st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
+            
+            st.markdown("---")
+            st.write(pace_comment)
+            
+            with st.expander(f"📊 {race_num}R の詳細データを見る"):
+                df_result = pd.DataFrame([{
+                    "馬番": h['horse_number'],
+                    "馬名": h['horse_name'],
+                    "スコア": round(h['score'], 2),
+                    "戦法": h.get('running_style', ''),
+                    "特記事項": h.get('special_flag', '')
+                } for h in sorted_horses])
+                st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
