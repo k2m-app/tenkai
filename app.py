@@ -6,69 +6,76 @@ from bs4 import BeautifulSoup
 import time
 import re
 import traceback
+import unicodedata
 
 # ==========================================
-# 1. 展開予想のコアロジック
+# 1. ペース解析・展開予想のコアロジック
 # ==========================================
 
-def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
+def time_to_seconds(time_str):
+    """ '1:22.7' のようなタイム文字列を秒に変換 """
+    if not isinstance(time_str, str) or ':' not in time_str:
+        return np.nan
+    try:
+        m, s = time_str.split(':')
+        return int(m) * 60 + float(s)
+    except:
+        return np.nan
+
+def extract_first_corner(text):
+    """ '－－⑩⑩' のような文字列から最初の通過順位(数字)を抽出 """
+    norm = unicodedata.normalize('NFKC', text)
+    matches = re.findall(r'\d+', norm)
+    if matches:
+        return int(matches[0])
+    return 7
+
+def calculate_early_pace_speed(row):
+    """ 前半(テン)の絶対スピード(m/s)を計算し、馬場・コース補正をかける """
+    if pd.isna(row['time_sec']) or pd.isna(row['f3_time']):
+        return np.nan
+    
+    early_time = row['time_sec'] - row['f3_time']
+    early_dist = row['distance'] - 600
+    if early_dist <= 0 or early_time <= 0:
+        return np.nan
+    
+    # 基準となる秒速 (m/s)
+    raw_speed = early_dist / early_time
+    
+    # --- 馬場状態による補正 ---
+    condition_mod = 0.0
+    if row['track_type'] == "芝":
+        if row['track_condition'] in ["重", "不良"]: condition_mod = +0.15 # タフな馬場で出した時計は価値が高い
+        elif row['track_condition'] == "稍": condition_mod = +0.05
+    elif row['track_type'] == "ダート":
+        if row['track_condition'] in ["重", "不良"]: condition_mod = -0.15 # 足抜きが良く時計が出やすい分を割り引く
+        elif row['track_condition'] == "稍": condition_mod = -0.05
+
+    # --- コース形態（芝スタートダート等）による補正 ---
+    course_mod = 0.0
+    turf_start_dirt = [("東京", 1600), ("中山", 1200), ("阪神", 1400), ("京都", 1400), ("新潟", 1200)]
+    if row['track_type'] == "ダート" and (row['venue'], row['distance']) in turf_start_dirt:
+        course_mod = -0.2 # 芝スタートで加速がつきやすかった分を割り引く
+
+    return raw_speed + condition_mod + course_mod
+
+def extract_jockey_target_position(past_races_df: pd.DataFrame, current_venue: str) -> float:
+    """ 同競馬場での成功体験（人気以上の着順or1着）を優先して狙う位置を抽出 """
     if past_races_df.empty: return 7.0 
+    
     is_success = (past_races_df['finish_position'] == 1) | (past_races_df['popularity'] > past_races_df['finish_position'])
+    is_same_venue = past_races_df['venue'] == current_venue
+    
+    venue_success_races = past_races_df[is_success & is_same_venue]
+    if not venue_success_races.empty:
+        return float(venue_success_races.iloc[0]['first_corner_pos'])
+    
     success_races = past_races_df[is_success]
     if not success_races.empty:
-        upset_score = success_races['popularity'] - success_races['finish_position']
-        win_bonus = np.where(success_races['finish_position'] == 1, 10, 0)
-        same_venue_bonus = np.where(success_races.get('is_same_venue', False), 8, 0)
-        success_score = upset_score + win_bonus + same_venue_bonus
-        best_memory_idx = success_score.idxmax()
-        return float(past_races_df.loc[best_memory_idx, 'first_corner_pos'])
-    else:
-        return float(past_races_df['first_corner_pos'].mean())
-
-def get_frame_specific_base_position(past_df, current_horse_num, total_horses):
-    if past_df.empty: return 7.0
-    is_current_inside = current_horse_num <= (total_horses / 2)
-    def check_inside(row):
-        return row['past_horse_num'] <= (row['past_total_horses'] / 2)
-    past_df['is_inside'] = past_df.apply(check_inside, axis=1)
-    same_frame_df = past_df[past_df['is_inside'] == is_current_inside]
-    
-    if len(same_frame_df) >= 2:
-        return same_frame_df['first_corner_pos'].median()
-    else:
-        return past_df['first_corner_pos'].median()
-
-def get_frame_modifier(venue, dist, track_type, horse_num, total_horses):
-    base_mod = (horse_num - 1) * 0.05 
-    outside_adv_courses = [
-        ("中山", 1200, "ダート"), ("東京", 1600, "ダート"),
-        ("阪神", 1400, "ダート"), ("京都", 1400, "ダート"),
-        ("新潟", 1000, "芝")
-    ]
-    if (venue, dist, track_type) in outside_adv_courses:
-        base_mod = (total_horses - horse_num) * 0.05 - 0.4
-    return base_mod
-
-def check_escape_only_horse(past_df: pd.DataFrame) -> bool:
-    if past_df.empty: return False
-    jra_df = past_df[~past_df['is_local']]
-    if jra_df.empty: return False
-    
-    escape_races = jra_df[jra_df['first_corner_pos'] == 1]
-    non_escape_races = jra_df[jra_df['first_corner_pos'] > 1]
-    
-    if escape_races.empty: return False 
-    escape_success = (escape_races['finish_position'] <= 3).any()
-    if not escape_success: return False
-    if not non_escape_races.empty:
-        non_escape_success = (non_escape_races['finish_position'] <= 3).any()
-        if non_escape_success: return False 
-            
-    recent_3_jra = jra_df.head(3)
-    if not (recent_3_jra['first_corner_pos'] == 1).any():
-        return False
+        return float(success_races.iloc[0]['first_corner_pos'])
         
-    return True
+    return float(past_races_df['first_corner_pos'].mean())
 
 def calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses):
     past_df = pd.DataFrame(horse['past_races'])
@@ -77,61 +84,25 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
         horse['special_flag'] = ""
         return 7.0 
     
-    frame_specific_median = get_frame_specific_base_position(past_df, horse['horse_number'], total_horses)
-    jockey_target = extract_jockey_target_position(past_df)
-    base_position = (frame_specific_median * 0.6) + (jockey_target * 0.4)
+    past_df['early_speed'] = past_df.apply(calculate_early_pace_speed, axis=1)
+    max_speed = past_df['early_speed'].max()
+    speed_advantage = 0.0
+    if not pd.isna(max_speed):
+        speed_advantage = (16.5 - max_speed) * 2.0 
+
+    jockey_target = extract_jockey_target_position(past_df, current_venue)
+    base_position = (jockey_target * 0.7) + speed_advantage
     
     last_race = past_df.iloc[0]
-    promotion_penalty = 1.0 if last_race['finish_position'] == 1 else 0.0
-    
-    dist_diff = last_race['distance'] - current_dist
-    clipped_diff = max(-400, min(400, dist_diff))
-    dist_modifier = (clipped_diff / 100.0) * 0.2 
     weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.25
-    local_modifier = -1.0 if last_race['is_local'] else 0.0
-    frame_modifier = get_frame_modifier(current_venue, current_dist, current_track, horse['horse_number'], total_horses)
     
-    recent_3_races = past_df.head(3)
-    if (recent_3_races['finish_position'] <= 5).any():
-        condition_modifier = -0.5 
-    else:
-        condition_modifier = 0.0  
-    horse['condition_mod'] = condition_modifier 
+    base_mod = (horse['horse_number'] - 1) * 0.05 
+    outside_adv_courses = [("中山", 1200, "ダート"), ("東京", 1600, "ダート"), ("阪神", 1400, "ダート"), ("京都", 1400, "ダート")]
+    if (current_venue, current_dist, current_track) in outside_adv_courses:
+        base_mod = (total_horses - horse['horse_number']) * 0.05 - 0.4
     
-    is_escape_only = check_escape_only_horse(past_df)
-    escape_modifier = -1.5 if is_escape_only else 0.0
-    horse['special_flag'] = "🔥逃げ専用(ハナ絶対)" if is_escape_only else ""
-
-    final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier + promotion_penalty + condition_modifier + escape_modifier
+    final_score = base_position + weight_modifier + base_mod
     return max(1.0, min(18.0, final_score))
-
-def apply_position_synergy(horses):
-    horses_sorted = sorted(horses, key=lambda x: x['horse_number'])
-    
-    # 1. 同型隣接の競り合い判定
-    for i in range(len(horses_sorted)):
-        h1 = horses_sorted[i]
-        if h1['score'] <= 3.5: 
-            for j in range(i+1, min(i+3, len(horses_sorted))):
-                h2 = horses_sorted[j]
-                if h2['score'] <= 3.5:
-                    h1['score'] -= 0.5
-                    h2['score'] -= 0.5
-                    h1['synergy'] = "隣接枠と先行争い"
-                    h2['synergy'] = "隣接枠と先行争い"
-    
-    # 2. 内枠逃げ馬の恩恵
-    for i in range(len(horses_sorted)):
-        current_score = horses_sorted[i]['score']
-        if 2.5 <= current_score <= 6.0 and not horses_sorted[i]['synergy']:
-            inner_horses = horses_sorted[max(0, i-2):i]
-            for inner_h in inner_horses:
-                if inner_h['score'] <= 2.0:
-                    horses_sorted[i]['score'] -= 0.8
-                    horses_sorted[i]['synergy'] = "内枠逃げ馬の恩恵"
-                    break 
-                    
-    return horses_sorted
 
 def format_formation(sorted_horses):
     if not sorted_horses: return ""
@@ -144,9 +115,7 @@ def format_formation(sorted_horses):
         elif score <= top_score + 4.5: chasers.append(num_str)
         elif score <= top_score + 9.5: mid.append(num_str)
         else: backs.append(num_str)
-    if not leaders and sorted_horses:
-        leaders.append(chr(9311 + sorted_horses[0]['horse_number']))
-        if chasers and chasers[0] == leaders[0]: chasers.pop(0)
+    
     parts = []
     if leaders: parts.append(f"({''.join(leaders)})")
     if chasers: parts.append("".join(chasers))
@@ -154,217 +123,186 @@ def format_formation(sorted_horses):
     if backs: parts.append("".join(backs))
     return " ".join(parts)
 
-def generate_short_comment(sorted_horses):
-    if len(sorted_horses) < 2: return "データ不足"
-    
-    top_score = sorted_horses[0]['score']
-    leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
-    leader_nums = "と".join([chr(9311 + h['horse_number']) for h in leaders])
-    gap_to_second = sorted_horses[1]['score'] - top_score if len(sorted_horses) > 1 else 10.0
-    
-    synergy_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy') == "内枠逃げ馬の恩恵"]
-    synergy_text = f"内枠の逃げ馬を利用して{synergy_horses[0]}が絶好の番手を取れそう。" if synergy_horses else ""
-    
-    conflict_horses = [chr(9311 + h['horse_number']) for h in sorted_horses if h.get('synergy') == "隣接枠と先行争い"]
-    conflict_text = f"隣接する{conflict_horses[0]}と{conflict_horses[1]}が競り合い、テンのペースは早くなる。" if len(conflict_horses) >= 2 else ""
-
-    escape_only_horses = [h for h in sorted_horses if h.get('special_flag')]
-    
-    if escape_only_horses and len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']:
-        base_cmt = f"🐢 スローペース\n逃げ専用の{chr(9311 + escape_only_horses[0]['horse_number'])}がハナを主張。他馬は無理に競りかけず隊列はすんなり決まりそう。"
-    elif len(leaders) >= 3: 
-        base_cmt = f"🔥 ハイペース\n{leader_nums}が激しくハナを主張し合い、テンは早くなりそう。縦長。"
-    elif len(leaders) == 2 and gap_to_second < 0.5: 
-        base_cmt = f"🏃 平均ペース\n{leader_nums}が並んで先行争い。"
-    elif gap_to_second >= 1.5: 
-        base_cmt = f"🐢 スローペース\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
-    else: 
-        base_cmt = f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
-    
-    final_cmt = base_cmt
-    if conflict_text: final_cmt += "\n⚔️ " + conflict_text
-    if synergy_text: final_cmt += "\n💡 " + synergy_text
-    
-    if escape_only_horses and not (len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']):
-        escape_nums = "、".join([chr(9311 + h['horse_number']) for h in escape_only_horses])
-        final_cmt += f"\n⚠️ 何としてもハナを切りたい{escape_nums}の出方次第でさらにペースが上がる可能性も。"
-        
-    return final_cmt
-
 # ==========================================
-# 2. スクレイピングロジック
+# 2. 競馬ラボ（縦型馬柱）スクレイピングロジック
 # ==========================================
 def fetch_real_data(race_id: str):
-    url = f"https://sports.yahoo.co.jp/keiba/race/denma/{race_id}?detail=1"
+    url = f"https://www.keibalab.jp/db/race/{race_id}/umabashira.html"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         response = requests.get(url, headers=headers)
         response.encoding = 'utf-8' 
         time.sleep(1) 
         soup = BeautifulSoup(response.text, 'html.parser')
-        if not soup.select_one('#denma_latest'): return None, 1600, "", "芝", "出馬表が見つかりません。"
         
-        current_venue = ""
-        venue_elem = soup.select_one('.hr-menuWhite__item--current .hr-menuWhite__text')
-        if venue_elem: current_venue = venue_elem.text.strip()
-            
-        current_dist = 1600 
+        # 開催情報の取得
+        p_about = soup.select_one('p[itemprop="about"]')
+        current_venue = "東京"
+        if p_about:
+            venue_m = re.search(r'(東京|中山|京都|阪神|中京|新潟|福島|小倉|札幌|函館)', p_about.text)
+            if venue_m: current_venue = venue_m.group(1)
+
+        course_li = soup.select('ul.classCourseSyokin li')
         current_track = "芝"
-        status_div = soup.select_one('.hr-predictRaceInfo__status')
-        if status_div:
-            dist_match = re.search(r'(\d{4})m', status_div.text)
-            if dist_match: current_dist = int(dist_match.group(1))
-            
-            track_match = re.search(r'(芝|ダート|障害)', status_div.text)
-            if track_match: current_track = track_match.group(1)
+        current_dist = 1600
+        if len(course_li) > 1:
+            course_text = course_li[1].text
+            current_track = "ダート" if "ダ" in course_text else "芝"
+            dist_m = re.search(r'\d+', course_text)
+            if dist_m: current_dist = int(dist_m.group(0))
+
+        # 馬柱テーブルの解析
+        tr_umaban = soup.select_one('tr.umaban')
+        tr_horseName = soup.select_one('tr.horseName')
+        trs_seirei = soup.select('tr.seirei')
+        tr_batai = trs_seirei[2] if len(trs_seirei) > 2 else None
+        
+        trs_zensou = []
+        for i in range(1, 6):
+            tr = soup.select_one(f'tr.zensou{i}')
+            if tr: trs_zensou.append(tr)
+
+        if not tr_umaban or not tr_horseName:
+            return None, current_dist, current_venue, current_track, "出馬表データが見つかりません。"
 
         horses_data = []
-        for tr_latest, tr_past in zip(soup.select('#denma_latest tbody tr'), soup.select('#denma_past tbody tr')):
-            num_elem = tr_latest.select_one('.hr-denma__number')
-            if not num_elem: continue
-            horse_num = int(num_elem.text.strip())
-            name_elem = tr_latest.select_one('.hr-denma__horse a')
-            horse_name = name_elem.text.strip() if name_elem else "不明"
-            info_td = tr_past.select_one('.hr-tableScroll__data--name')
-            current_weight = 55.0
-            if info_td and info_td.find_all('p'):
-                try: current_weight = float(info_td.find_all('p')[-1].text.strip())
-                except: pass
-
+        cols = tr_umaban.find_all(['td', 'th'])
+        
+        # 右から左（内枠）へ配置されているデータをパース（tdのインデックス2〜最後の手前まで）
+        for i in range(2, len(cols) - 1):
+            h_num_text = cols[i].text.strip()
+            if not h_num_text.isdigit(): continue
+            horse_num = int(h_num_text)
+            
+            horse_name_elem = tr_horseName.find_all(['td', 'th'])[i].select_one('.bamei')
+            horse_name = horse_name_elem.text.strip() if horse_name_elem else "不明"
+            
+            batai_text = tr_batai.find_all(['td', 'th'])[i].text.strip() if tr_batai else ""
+            weight_m = re.search(r'^(\d{3})', batai_text)
+            current_weight = float(weight_m.group(1)) if weight_m else 480.0
+            
             past_races = []
-            for td in tr_past.select('.hr-tableScroll__data--race'):
-                arr_elem = td.select_one('.hr-denma__arrival')
-                if not arr_elem: continue 
-                try: finish_pos = int(re.search(r'\d+', arr_elem.text).group())
-                except: continue 
-                txt = td.text
-                pop_match = re.search(r'\((\d+)人気\)', txt)
-                popularity = int(pop_match.group(1)) if pop_match else 7
-                pass_elem = td.select_one('.hr-denma__passing')
-                first_corner = int(re.search(r'^(\d+)', pass_elem.text.strip()).group(1)) if pass_elem and re.search(r'^(\d+)', pass_elem.text.strip()) else 7
-                dist_match_past = re.search(r'(\d{4})m', txt)
-                distance = int(dist_match_past.group(1)) if dist_match_past else current_dist
-                is_local = any(loc in txt for loc in ["川崎", "大井", "船橋", "浦和", "門別", "盛岡", "水沢", "園田", "姫路", "高知", "佐賀", "名古屋", "笠松", "金沢", "帯広"])
+            for tr_z in trs_zensou:
+                td_z = tr_z.find_all(['td', 'th'])[i]
+                if not td_z.select_one('.zensouTable'): continue
                 
-                horse_num_match = re.search(r'(\d+)頭\s+(\d+)番', txt)
-                past_total_horses = int(horse_num_match.group(1)) if horse_num_match else 16
-                past_horse_num = int(horse_num_match.group(2)) if horse_num_match else 8
-
-                is_same_venue = False
-                date_spans = td.select('.hr-denma__date span')
-                if len(date_spans) >= 2 and current_venue and date_spans[1].text.strip() in current_venue: is_same_venue = True
-                elif current_venue and current_venue in txt: is_same_venue = True
-
-                past_j_elem = td.select_one('.hr-denma__jockey')
-                past_weight = float(re.search(r'\((\d{2}(?:\.\d)?)\)', past_j_elem.text).group(1)) if past_j_elem and re.search(r'\((\d{2}(?:\.\d)?)\)', past_j_elem.text) else current_weight
-
+                # 競馬場・コース・距離・馬場
+                li_elements = td_z.select('ul.daybaba li')
+                if len(li_elements) < 3: continue
+                
+                p_venue_m = re.search(r'(東京|中山|京都|阪神|中京|新潟|福島|小倉|札幌|函館)', li_elements[0].text)
+                p_venue = p_venue_m.group(1) if p_venue_m else current_venue
+                
+                p_track_m = re.search(r'(芝|ダ)', li_elements[2].text)
+                p_track = "ダート" if p_track_m and p_track_m.group(1) == "ダ" else "芝"
+                
+                p_dist_m = re.search(r'\d+', li_elements[2].text)
+                p_dist = int(p_dist_m.group(0)) * 100 if p_dist_m else current_dist
+                
+                cond_m = re.search(r'(良|稍|重|不)', li_elements[2].text)
+                p_cond = cond_m.group(1) if cond_m else "良"
+                if p_cond == "不": p_cond = "不良"
+                
+                # 着順
+                cyaku_m = td_z.select_one('.cyakuJun')
+                finish_pos = int(cyaku_m.text) if cyaku_m and cyaku_m.text.isdigit() else 5
+                
+                # タイム・人気・上がり3F
+                std11_tds = td_z.select('tr:nth-of-type(3) td')
+                time_text = ""
+                f3_time = np.nan
+                popularity = 5
+                
+                if std11_tds:
+                    t_text = std11_tds[0].text
+                    pop_m = re.search(r'(\d+)人', t_text)
+                    popularity = int(pop_m.group(1)) if pop_m else 5
+                    
+                    time_m = re.search(r'(\d+:\d{2}\.\d+)', t_text)
+                    time_text = time_m.group(1) if time_m else ""
+                    
+                    f3_span = std11_tds[0].select_one('span[class^="bgRise"]')
+                    if f3_span:
+                        try: f3_time = float(f3_span.text.strip())
+                        except: pass
+                
+                # 位置取り
+                pos_td = td_z.select_one('.zensou')
+                first_corner = extract_first_corner(pos_td.text) if pos_td else 7
+                
                 past_races.append({
-                    'finish_position': finish_pos, 'popularity': popularity,
-                    'first_corner_pos': first_corner, 'distance': distance,
-                    'weight': past_weight, 'is_local': is_local, 'is_same_venue': is_same_venue,
-                    'past_total_horses': past_total_horses, 'past_horse_num': past_horse_num
+                    'venue': p_venue, 'track_type': p_track, 'distance': p_dist,
+                    'track_condition': p_cond, 'finish_position': finish_pos, 'popularity': popularity,
+                    'time_sec': time_to_seconds(time_text), 'f3_time': f3_time,
+                    'first_corner_pos': first_corner, 'weight': current_weight
                 })
+
             horses_data.append({
                 'horse_number': horse_num, 'horse_name': horse_name,
                 'current_weight': current_weight, 'past_races': past_races,
                 'synergy': "", 'condition_mod': 0.0, 'special_flag': ""
             })
-        if not horses_data: return None, 1600, "", "芝", "データがありません。"
+
+        if not horses_data: return None, 1600, "", "芝", "馬データが取得できませんでした。"
+        
+        # 馬番順にソート (HTMLは外枠から並んでいるため)
+        horses_data = sorted(horses_data, key=lambda x: x['horse_number'])
         return horses_data, current_dist, current_venue, current_track, None
+        
     except Exception as e:
         return None, 1600, "", "芝", f"エラー: {e}\n{traceback.format_exc()}"
+
 
 # ==========================================
 # 3. スマホ対応UI
 # ==========================================
-st.set_page_config(page_title="スマホで競馬展開予想", page_icon="🏇", layout="centered")
+st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想")
-st.markdown("枠順バイアス・調子・隣接馬の競り合いシナジーまで考慮するプロ仕様の隊列予測です。")
+st.title("🏇 AI競馬展開予想 (ペース補正版)")
+st.markdown("競馬ラボの出馬表から絶対ペース・馬場補正を計算し、勝負気配を読み取ります。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
-    base_url_input = st.text_input("🔗 Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1")
+    base_url_input = st.text_input("🔗 競馬ラボのレースURL", value="https://www.keibalab.jp/db/race/202602210910/")
     
-    # 【NEW】開催スケジュールへのリンクを追加
-    st.caption("🔍 [開催スケジュールからレースURLを探す（Yahoo!競馬）](https://sports.yahoo.co.jp/keiba/schedule/monthly/)")
-    
-    st.markdown("**🎯 予想したいレースを選択（複数可）**")
-    
-    try:
-        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R", selection_mode="multi")
-    except TypeError:
-        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=11, format_func=lambda x: f"{x}R")
-
-    if not isinstance(selected_races, list):
-        if selected_races is None:
-            selected_races = []
-        else:
-            selected_races = [selected_races]
-
     col1, col2 = st.columns(2)
     with col1:
-        execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True)
-    with col2:
-        execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
+        execute_btn = st.button("🚀 このレースを予想", type="primary", use_container_width=True)
 
-races_to_run = []
-if execute_all_btn:
-    races_to_run = list(range(1, 13))
-elif execute_btn:
-    if not selected_races:
-        st.warning("レース番号を選択してください。")
-        st.stop()
-    races_to_run = selected_races
-
-if races_to_run:
-    match = re.search(r'\d{10}', base_url_input)
+if execute_btn:
+    match = re.search(r'\d{12}', base_url_input)
     if not match:
-        st.error("有効なYahoo!競馬のレースIDが見つかりません。")
+        st.error("有効な競馬ラボのレースIDが見つかりません。")
         st.stop()
         
-    base_id = match.group()[:8] 
+    target_race_id = match.group()
     
-    for race_num in sorted(races_to_run):
-        target_race_id = f"{base_id}{race_num:02d}"
+    with st.spinner("出馬表と過去走データを解析中..."):
+        horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
         
-        st.markdown(f"### 🏁 {race_num}R")
+        if error_msg:
+            st.warning(error_msg)
+            st.stop()
+            
+        total_horses = len(horses)
         
-        with st.spinner(f"{race_num}Rを解析中..."):
-            horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(target_race_id)
+        for horse in horses:
+            horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
             
-            if error_msg:
-                st.warning("出馬表データがまだ確定していないか、取得できませんでした。")
-                continue
-                
-            total_horses = len(horses)
-            
-            for horse in horses:
-                horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
-            
-            horses = apply_position_synergy(horses)
-                
-            sorted_horses = sorted(horses, key=lambda x: x['score'])
-            formation_text = format_formation(sorted_horses)
-            comment = generate_short_comment(sorted_horses)
+        sorted_horses = sorted(horses, key=lambda x: x['score'])
+        formation_text = format_formation(sorted_horses)
 
-            st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
-            
-            st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
-            st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
-            
-            st.markdown("---")
-            st.write(comment)
-            
-            with st.expander(f"📊 {race_num}R の詳細スコアを見る"):
-                df_result = pd.DataFrame([{
-                    "馬番": h['horse_number'],
-                    "馬名": h['horse_name'],
-                    "スコア": round(h['score'], 2),
-                    "斤量差": f"{round(h['current_weight'] - h['past_races'][0]['weight'], 1):+}" if h['past_races'] else "-",
-                    "調子補正": f"{h.get('condition_mod', 0.0):+}",
-                    "特記事項": f"{h.get('special_flag', '')} {h.get('synergy', '')}".strip()
-                } for h in sorted_horses])
-                st.dataframe(df_result, use_container_width=True, hide_index=True)
-                
-        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.info(f"📏 条件: **{current_venue} {current_track}{current_dist}m** ({total_horses}頭立て)")
+        
+        st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='text-align: center; color: #FF4B4B;'>{formation_text}</h3>", unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        with st.expander("📊 詳細スコアを見る (低いほど前に行ける)"):
+            df_result = pd.DataFrame([{
+                "馬番": h['horse_number'],
+                "馬名": h['horse_name'],
+                "スコア": round(h['score'], 2),
+            } for h in sorted_horses])
+            st.dataframe(df_result, use_container_width=True, hide_index=True)
