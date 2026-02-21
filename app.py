@@ -8,7 +8,7 @@ import re
 import traceback
 
 # ==========================================
-# 1. 展開予想のコアロジック (変更なし)
+# 1. 展開予想のコアロジック
 # ==========================================
 def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
     if past_races_df.empty: return 7.0 
@@ -27,17 +27,26 @@ def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
 def calculate_pace_score(horse, current_dist):
     past_df = pd.DataFrame(horse['past_races'])
     if past_df.empty: return 7.0 
-    recent_3_avg = past_df.head(3)['first_corner_pos'].mean()
+    
+    # 【NEW】出遅れノイズカット：平均値(mean)ではなく中央値(median)を使用し、突発的な不利を無視する
+    recent_3_median = past_df.head(3)['first_corner_pos'].median()
     jockey_target = extract_jockey_target_position(past_df)
-    base_position = (recent_3_avg * 0.6) + (jockey_target * 0.4)
+    base_position = (recent_3_median * 0.6) + (jockey_target * 0.4)
+    
     last_race = past_df.iloc[0]
+    
+    # 【NEW】昇級戦ショック：前走1着馬は相手強化でペースが速くなり、相対的に前に行きにくくなるためペナルティを加算
+    promotion_penalty = 1.0 if last_race['finish_position'] == 1 else 0.0
+    
     dist_diff = last_race['distance'] - current_dist
     clipped_diff = max(-400, min(400, dist_diff))
     dist_modifier = (clipped_diff / 100.0) * 0.2 
     weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.25
     local_modifier = -1.0 if last_race['is_local'] else 0.0
     frame_modifier = (horse['horse_number'] - 1) * 0.05
-    final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier
+    
+    # 全ファクターの合算
+    final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier + promotion_penalty
     return max(1.0, min(18.0, final_score))
 
 def format_formation(sorted_horses):
@@ -73,7 +82,7 @@ def generate_short_comment(sorted_horses):
     else: return f"🚶 平均〜スローペース\n{leader_nums}が主導権を握るが、競りかける馬はおらず落ち着きそう。"
 
 # ==========================================
-# 2. スクレイピングロジック (変更なし)
+# 2. スクレイピングロジック
 # ==========================================
 def fetch_real_data(race_id: str):
     url = f"https://sports.yahoo.co.jp/keiba/race/denma/{race_id}?detail=1"
@@ -146,9 +155,9 @@ def fetch_real_data(race_id: str):
         return None, 1600, f"エラー: {e}\n{traceback.format_exc()}"
 
 # ==========================================
-# 3. スマホ対応UI (ここを大幅変更)
+# 3. スマホ対応UI (UI修正)
 # ==========================================
-st.set_page_config(page_title="スマホで競馬展開予想", page_icon="🏇", layout="centered") # layoutをcenteredに
+st.set_page_config(page_title="スマホで競馬展開予想", page_icon="🏇", layout="centered")
 
 st.title("🏇 AI競馬展開予想")
 st.markdown("スマホでURLをコピペして、サクッと隊列とペースを予測します。")
@@ -159,16 +168,28 @@ with st.container(border=True):
     base_url_input = st.text_input("🔗 Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1", placeholder="ここにURLをペースト")
     
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
-    # スマホで押しやすいようにpillsを使用 (Streamlit 1.30以上で有効)
-    try:
-        selected_races = st.pills("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
-    except AttributeError:
-        # pillsが使えないバージョン用のフォールバック
-        selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
+    # 確実な複数選択ができるmultiselectを採用
+    selected_races = st.multiselect("レース番号", options=list(range(1, 13)), default=[11], format_func=lambda x: f"{x}R")
 
-    execute_btn = st.button("🚀 予想を実行する", type="primary", use_container_width=True) # 幅いっぱいのボタン
+    # ボタンを横並びに配置（全レースボタン追加）
+    col1, col2 = st.columns(2)
+    with col1:
+        execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True)
+    with col2:
+        execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
 
-if execute_btn:
+# どちらのボタンが押されたかで処理を分岐
+races_to_run = []
+if execute_all_btn:
+    races_to_run = list(range(1, 13))
+elif execute_btn:
+    if not selected_races:
+        st.warning("レース番号を選択してください。")
+        st.stop()
+    races_to_run = selected_races
+
+# 実行処理ループ
+if races_to_run:
     match = re.search(r'\d{10}', base_url_input)
     if not match:
         st.error("有効なYahoo!競馬のレースID(10桁)が見つかりません。")
@@ -176,11 +197,7 @@ if execute_btn:
         
     base_id = match.group()[:8] 
     
-    if not selected_races:
-        st.warning("レース番号を1つ以上選択してください。")
-        st.stop()
-        
-    for race_num in sorted(selected_races):
+    for race_num in sorted(races_to_run):
         target_race_id = f"{base_id}{race_num:02d}"
         
         st.markdown(f"### 🏁 {race_num}R")
@@ -189,7 +206,7 @@ if execute_btn:
             horses, current_dist, error_msg = fetch_real_data(target_race_id)
             
             if error_msg:
-                st.error(f"データ取得失敗")
+                st.warning(f"出馬表データがまだ確定していないか、取得できませんでした。")
                 continue
                 
             for horse in horses:
@@ -199,7 +216,6 @@ if execute_btn:
             formation_text = format_formation(sorted_horses)
             comment = generate_short_comment(sorted_horses)
 
-            # 結果の描画（スマホで見やすいように大きく）
             st.info(f"📏 距離: **{current_dist}m**")
             
             st.markdown(f"<h4 style='text-align: center; letter-spacing: 2px;'>◀(進行方向)</h4>", unsafe_allow_html=True)
@@ -208,7 +224,6 @@ if execute_btn:
             st.markdown("---")
             st.write(comment)
             
-            # 詳細はアコーディオンに隠して画面をスッキリさせる
             with st.expander(f"📊 {race_num}R の詳細スコアを見る"):
                 df_result = pd.DataFrame([{
                     "馬番": h['horse_number'],
@@ -216,6 +231,6 @@ if execute_btn:
                     "スコア": round(h['score'], 2),
                     "斤量": h['current_weight']
                 } for h in sorted_horses])
-                st.dataframe(df_result, use_container_width=True, hide_index=True) # indexを隠してスマホで見やすく
+                st.dataframe(df_result, use_container_width=True, hide_index=True)
                 
-        st.markdown("<br><br>", unsafe_allow_html=True) # レース間の余白
+        st.markdown("<br><br>", unsafe_allow_html=True)
