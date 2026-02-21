@@ -30,42 +30,69 @@ def extract_jockey_target_position(past_races_df: pd.DataFrame) -> float:
         return float(past_races_df['first_corner_pos'].mean())
 
 def calculate_pace_score(horse, current_dist):
-    """各馬の予想ポジションスコアを算出（値が小さいほど前に行く）"""
+    """各馬の予想ポジションスコアを算出（プロ仕様の補正版）"""
     past_df = pd.DataFrame(horse['past_races'])
-    base_position = extract_jockey_target_position(past_df)
     
     if past_df.empty:
-        return base_position
+        return 7.0 
         
+    # --- 1. ベース先行力の算出（馬の実力60% + 騎手心理40%） ---
+    recent_3_avg = past_df.head(3)['first_corner_pos'].mean() # 近3走の平均位置
+    jockey_target = extract_jockey_target_position(past_df)   # 成功体験バイアス
+    base_position = (recent_3_avg * 0.6) + (jockey_target * 0.4)
+    
     last_race = past_df.iloc[0]
     
-    # ① 距離変動の補正
-    # 今回が前走より短ければ前を取りにくい(+補正)、前走より長ければ前を取りやすい(-補正)
+    # --- 2. 距離変動の補正 (キャップ制御) ---
     dist_diff = last_race['distance'] - current_dist
-    dist_modifier = (dist_diff / 100.0) * 0.5 
+    # 距離差の影響は最大±400m分に留める（極端な延長・短縮によるバグを防ぐ）
+    clipped_diff = max(-400, min(400, dist_diff))
+    dist_modifier = (clipped_diff / 100.0) * 0.2 # 100mにつき0.2動く(最大±0.8)
     
-    # ② 斤量変動の補正
-    # 騎手の斤量が減るといつもより前にいきやすい(-補正)
-    weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.5
+    # --- 3. 斤量変動の補正 (マイルド化) ---
+    weight_modifier = (horse['current_weight'] - last_race['weight']) * 0.25
     
-    # ③ 地方競馬補正
-    # 地方競馬場で走っているときは、いつもよりかなり前の位置を取りやすい(-補正)
-    local_modifier = -2.0 if last_race['is_local'] else 0.0
+    # --- 4. 地方競馬補正 ---
+    local_modifier = -1.0 if last_race['is_local'] else 0.0
     
-    final_score = base_position + dist_modifier + weight_modifier + local_modifier
+    # --- 5. 枠順補正（外枠ほど前に行きにくいロスを加算） ---
+    # 1番を基準とし、1枠外に行くごとに0.05ポイント位置が下がる
+    frame_modifier = (horse['horse_number'] - 1) * 0.05
+
+    final_score = base_position + dist_modifier + weight_modifier + local_modifier + frame_modifier
+    
+    # 1.0(大逃げ) 〜 18.0(最後方) の範囲に丸める
     return max(1.0, min(18.0, final_score))
 
 def format_formation(sorted_horses):
-    """展開のフォーマット：(⑥⑧) ⑨④③②① ⑤⑦"""
-    leaders, chasers, mid, backs = [], [], [], []
-    for h in sorted_horses:
-        num_str = chr(9311 + h['horse_number'])
-        score = h['score']
-        if score <= 4.0: leaders.append(num_str)
-        elif score <= 8.0: chasers.append(num_str)
-        elif score <= 13.0: mid.append(num_str)
-        else: backs.append(num_str)
+    """展開のフォーマット：相対評価で隊列を組む"""
+    if not sorted_horses:
+        return ""
         
+    leaders, chasers, mid, backs = [], [], [], []
+    
+    # そのレースで最も前に行く馬（トップ）のスコアを基準にする
+    top_score = sorted_horses[0]['score']
+    
+    for h in sorted_horses:
+        num_str = chr(9311 + h['horse_number']) # 丸囲み数字
+        score = h['score']
+        
+        # トップ馬との「差」で相対的に脚質を分類する
+        if score <= top_score + 1.2 and len(leaders) < 3:
+            # トップから1.2差以内、かつ最大3頭までが「逃げ争い」
+            leaders.append(num_str)
+        elif score <= top_score + 4.5:
+            # トップを射程圏に入れる「好位・先行」
+            chasers.append(num_str)
+        elif score <= top_score + 9.5:
+            # 「中団」
+            mid.append(num_str)
+        else:
+            # 「後方・追込」
+            backs.append(num_str)
+            
+    # フェイルセーフ（万が一逃げ馬がいない場合）
     if not leaders and sorted_horses:
         leaders.append(chr(9311 + sorted_horses[0]['horse_number']))
         if chasers and chasers[0] == leaders[0]:
@@ -79,24 +106,26 @@ def format_formation(sorted_horses):
     return " ".join(parts)
 
 def generate_short_comment(sorted_horses):
-    """展開順に基づく短評の自動生成"""
+    """相対的なスコア差から展開の起伏を読む短評生成"""
     if len(sorted_horses) < 2:
         return "出走馬データが不足しているため、展開予想を生成できません。"
         
-    leaders = [h for h in sorted_horses if h['score'] <= 4.0]
-    if not leaders:
-        leaders = [sorted_horses[0]]
-        if len(sorted_horses) > 1 and sorted_horses[1]['score'] - sorted_horses[0]['score'] < 1.0:
-            leaders.append(sorted_horses[1])
-            
+    top_score = sorted_horses[0]['score']
+    leaders = [h for h in sorted_horses if h['score'] <= top_score + 1.2][:3]
+    
     leader_nums = "と".join([chr(9311 + h['horse_number']) for h in leaders])
     
+    # 2番手の馬がトップからどれくらい離れているかでペース判定
+    gap_to_second = sorted_horses[1]['score'] - top_score
+    
     if len(leaders) >= 3:
-        return f"ハイペース。{leader_nums}が激しく逃げを争う展開で、ペースは早くなりそう。"
-    elif len(leaders) == 2:
-        return f"平均ペース。{leader_nums}が逃げたがるがそれ以外は不在。"
+        return f"ハイペース。{leader_nums}がハナを主張し合い、テンのペースは早くなりそう。縦長の展開か。"
+    elif len(leaders) == 2 and gap_to_second < 0.5:
+        return f"平均ペース。{leader_nums}が並んで先行争い。隊列は比較的すんなり決まりそう。"
+    elif gap_to_second >= 1.5:
+        return f"スローペース。{leader_nums}が楽に単騎逃げの形を作れそう。後続は折り合い重視の展開。"
     else:
-        return f"スローペース。{leader_nums}の単騎逃げの形になりそうで、ペースは落ち着く可能性が高い。"
+        return f"平均〜スローペース。{leader_nums}が主導権を握るが、競りかける馬はおらずペースは落ち着く可能性が高い。"
 
 # ==========================================
 # 2. Yahoo!スポーツ競馬・BeautifulSoup解析ロジック
@@ -230,7 +259,7 @@ def fetch_real_data(race_id: str):
 st.set_page_config(page_title="AI競馬展開予想 (Yahoo!競馬版)", page_icon="🏇", layout="wide")
 
 st.title("🏇 AI競馬展開予想 (複数レース一括処理)")
-st.markdown("Yahoo!競馬のデータから、距離増減、斤量、騎手の成功体験バイアスを元に隊列を予測します。")
+st.markdown("Yahoo!競馬のデータから、距離増減、斤量、枠順、騎手の成功体験バイアスを元に隊列を予測します。")
 
 # --- サイドバーUI ---
 st.sidebar.header("レース条件設定")
