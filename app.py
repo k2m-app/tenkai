@@ -6,7 +6,6 @@ from bs4 import BeautifulSoup
 import time
 import re
 import traceback
-import datetime
 
 # ==========================================
 # 1. 展開予想のコアロジック
@@ -72,43 +71,45 @@ def generate_short_comment(sorted_horses):
     return comment
 
 # ==========================================
-# 2. 競馬ラボ・BeautifulSoupスクレイピングロジック
+# 2. Yahoo!スポーツ競馬・BeautifulSoup解析ロジック
 # ==========================================
 
 def fetch_real_data(race_id: str):
-    """競馬ラボの馬柱ページから直接HTMLタグをパースしてデータを取得する"""
-    url = f"https://www.keibalab.jp/db/race/{race_id}/umabashira.html"
+    """Yahoo!競馬の出馬表（詳細）ページをパースしてデータを取得する"""
+    url = f"https://sports.yahoo.co.jp/keiba/race/denma/{race_id}?detail=1"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     try:
         response = requests.get(url, headers=headers)
-        response.encoding = 'utf-8'
-        time.sleep(1) # 複数レース取得時のサーバー負荷軽減
+        response.encoding = 'utf-8' # Yahoo競馬はUTF-8
+        time.sleep(1) # 連続アクセス時のマナー
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 今回のレース距離をタイトルタグ等から自動抽出（例: ダ1600m -> 1600）
-        current_dist = 1600 # デフォルト値
-        title_text = soup.title.text if soup.title else ""
-        dist_match = re.search(r'(\d{4})m', title_text)
+        # 今回のレース距離を抽出 (ページ内のテキストから "芝1600m" や "ダ1400m" を探す)
+        current_dist = 1600 
+        page_text = soup.get_text()
+        dist_match = re.search(r'(?:芝|ダ|障)\s*(\d{4})m', page_text)
         if dist_match:
             current_dist = int(dist_match.group(1))
-            
-        # 競馬ラボの馬柱テーブルを取得
-        table = soup.find('table', class_=re.compile(r'umabashira|dataTbl', re.I))
-        if not table:
-            return None, current_dist, "馬柱テーブルが見つかりません。出馬表が未公開の可能性があります。"
 
         horses_data = []
         
-        for tr in table.find_all('tr'):
+        # Yahoo競馬の馬柱は <tr> 単位で構成されているため、行ごとにパース
+        for tr in soup.find_all('tr'):
             tds = tr.find_all(['td', 'th'])
             if len(tds) < 5: continue
                 
-            # 馬名抽出
-            a_tag = tr.find('a', href=re.compile(r'/db/horse/'))
-            if not a_tag: continue
-            horse_name = a_tag.text.strip()
+            row_text = tr.get_text(separator=' ', strip=True)
+            
+            # 馬名抽出（hrefにhorseが含まれるリンクを探す）
+            a_tags = tr.find_all('a')
+            horse_name = ""
+            for a in a_tags:
+                if 'horse' in a.get('href', ''):
+                    horse_name = a.text.strip()
+                    break
+            if not horse_name: continue
             
             # 馬番抽出
             horse_num = None
@@ -120,45 +121,45 @@ def fetch_real_data(race_id: str):
                 
             # 今回斤量抽出
             current_weight = 55.0
-            for td in tds:
-                txt = td.text.strip()
-                match_weight = re.search(r'(?:5[0-9]|6[0-3]|4[8-9])\.\d', txt)
-                if match_weight and "kg" not in txt and len(txt) < 20:
-                    current_weight = float(match_weight.group())
-                    break
+            weight_match = re.search(r'(?:5[0-9]|6[0-3]|4[8-9])\.\d', row_text)
+            if weight_match:
+                current_weight = float(weight_match.group())
 
             past_races = []
             
-            # 過去走データ抽出
-            potential_past_tds = [td for td in tds if "走" in td.text or "m" in td.text or "着" in td.text or "人" in td.text]
+            # 過去走データは文字数が多いtd（着順や距離が含まれる）に集約されている
+            potential_past_tds = [td for td in tds if len(td.text.strip()) > 15 and ("着" in td.text or "人" in td.text or "m" in td.text)]
             if not potential_past_tds:
                 potential_past_tds = tds[-5:]
 
             for td in potential_past_tds[:5]:
                 txt = td.text.strip()
-                if len(txt) < 15: continue 
+                if len(txt) < 10: continue 
                     
                 try:
-                    txt_clean = re.sub(r'(?:前走|\d走前)', '', txt).strip()
-                    finish_match = re.search(r'^(\d{1,2})', txt_clean)
+                    # 着順 (例: "1着" や文頭の数字)
+                    finish_match = re.search(r'(\d+)着', txt)
+                    if not finish_match:
+                        finish_match = re.search(r'^(\d{1,2})\b', txt)
                     if not finish_match: continue
                     finish_pos = int(finish_match.group(1))
 
+                    # 人気 (例: "3人")
                     pop_match = re.search(r'(\d+)人', txt)
                     popularity = int(pop_match.group(1)) if pop_match else 7
 
-                    corner_match = re.search(r'([①-⑱])', txt)
-                    if corner_match:
-                        circle_nums = {'①':1, '②':2, '③':3, '④':4, '⑤':5, '⑥':6, '⑦':7, '⑧':8, '⑨':9, '⑩':10, '⑪':11, '⑫':12, '⑬':13, '⑭':14, '⑮':15, '⑯':16, '⑰':17, '⑱':18}
-                        first_corner = circle_nums.get(corner_match.group(1), 7)
-                    else:
-                        first_corner = 7
+                    # コーナー通過順 (例: "2-2-1" の最初の数字)
+                    corner_match = re.search(r'(\d+)-\d+', txt)
+                    first_corner = int(corner_match.group(1)) if corner_match else 7
 
-                    dist_match_past = re.search(r'(?:芝|ダ|障)(\d+)m', txt)
+                    # 距離
+                    dist_match_past = re.search(r'(?:芝|ダ|障)(\d+)m?', txt)
                     distance = int(dist_match_past.group(1)) if dist_match_past else current_dist
 
+                    # 地方競馬判定
                     is_local = any(loc in txt for loc in ["川崎", "大井", "船橋", "浦和", "門別", "盛岡", "水沢", "園田", "姫路", "高知", "佐賀", "名古屋", "笠松", "金沢", "帯広"])
 
+                    # 過去斤量
                     weight_matches = re.findall(r'(?:5[0-9]|6[0-3]|4[8-9])\.\d', txt)
                     past_weight = float(weight_matches[-1]) if weight_matches else current_weight
 
@@ -180,67 +181,68 @@ def fetch_real_data(race_id: str):
                 'past_races': past_races
             })
 
+        # データが正しく取得できたかの判定
+        if not horses_data:
+            return None, current_dist, "馬柱データが見つかりませんでした。URLが間違っているか、出馬表が未確定です。"
+            
         return horses_data, current_dist, None
 
     except Exception as e:
         error_msg = traceback.format_exc()
-        return None, 1600, f"エラーが発生しました: {e}\n{error_msg}"
+        return None, 1600, f"スクレイピング中にエラーが発生しました: {e}\n{error_msg}"
 
 # ==========================================
 # 3. Streamlit UI
 # ==========================================
 
-st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="wide")
+st.set_page_config(page_title="AI競馬展開予想 (Yahoo!競馬版)", page_icon="🏇", layout="wide")
 
 st.title("🏇 AI競馬展開予想 (複数レース一括処理)")
-st.markdown("競馬ラボのデータから、距離増減、斤量、騎手の成功体験バイアスを元に隊列を予測します。")
+st.markdown("Yahoo!競馬のデータから、距離増減、斤量、騎手の成功体験バイアスを元に隊列を予測します。")
 
 # --- サイドバーUI ---
 st.sidebar.header("レース条件設定")
+st.sidebar.markdown("例: `https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1`")
 
-# 1. 日付選択 (デフォルトを2026年2月21日に設定)
-target_date = st.sidebar.date_input("開催日", datetime.date(2026, 2, 21))
-date_str = target_date.strftime("%Y%m%d")
+# 1. 基準となるURLの入力
+base_url_input = st.sidebar.text_input("Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1")
 
-# 2. 競馬場選択
-venues = {
-    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
-    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
-}
-venue_code = st.sidebar.selectbox("競馬場", options=list(venues.keys()), format_func=lambda x: f"{venues[x]} ({x})", index=4) # デフォルト東京
-
-# 3. レース番号選択 (複数選択可能)
+# 2. レース番号選択 (複数選択可能)
 selected_races = st.sidebar.multiselect(
-    "レース番号 (複数選択可)", 
+    "展開を予想したいレース番号 (複数選択可)", 
     options=list(range(1, 13)), 
     default=[11], 
     format_func=lambda x: f"{x}R"
 )
 
 if st.sidebar.button("予想を実行する", type="primary"):
+    # URLから10桁のベースID（最初の8桁: 年/場/回/日）を抽出
+    match = re.search(r'\d{10}', base_url_input)
+    if not match:
+        st.error("有効なYahoo!競馬のレースID(10桁)が見つかりません。URLを確認してください。")
+        st.stop()
+        
+    base_id = match.group()[:8] # 例: 26050107
+    
     if not selected_races:
         st.warning("レース番号を1つ以上選択してください。")
         st.stop()
         
     for race_num in sorted(selected_races):
-        # レースIDの生成 (例: 202602210511)
-        race_id = f"{date_str}{venue_code}{race_num:02d}"
+        # レースIDの生成 (ベースID + レース番号2桁)
+        target_race_id = f"{base_id}{race_num:02d}"
+        target_url = f"https://sports.yahoo.co.jp/keiba/race/denma/{target_race_id}?detail=1"
         
-        st.header(f"🏁 {venues[venue_code]} {race_num}R (距離自動取得)")
-        st.caption(f"参照URL: https://www.keibalab.jp/db/race/{race_id}/umabashira.html")
+        st.header(f"🏁 {race_num}R (距離自動取得)")
+        st.caption(f"参照URL: {target_url}")
         
         with st.spinner(f"{race_num}Rのデータを取得・解析中..."):
-            horses, current_dist, error_msg = fetch_real_data(race_id)
+            horses, current_dist, error_msg = fetch_real_data(target_race_id)
             
             if error_msg:
                 st.error(f"{race_num}Rのデータ取得に失敗しました。")
                 with st.expander("エラー詳細"):
                     st.code(error_msg)
-                st.divider()
-                continue
-            
-            if not horses:
-                st.warning(f"{race_num}Rの出馬表データがありません。")
                 st.divider()
                 continue
                 
@@ -281,4 +283,4 @@ if st.sidebar.button("予想を実行する", type="primary"):
                 } for h in sorted_horses])
                 st.dataframe(df_result, use_container_width=True)
                 
-        st.divider() # レースごとの区切り線
+        st.divider()
