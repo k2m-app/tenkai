@@ -13,13 +13,11 @@ import unicodedata
 # ==========================================
 
 def calculate_early_pace_speed(row, current_dist):
-    """ 前半3F(600m)のタイムから絶対スピード(m/s)を計算し、距離・馬場・コース補正をかける """
     if pd.isna(row.get('early_3f')):
         return np.nan
     
     raw_speed = 600.0 / row['early_3f']
     
-    # 1. 馬場状態による補正
     condition_mod = 0.0
     if row['track_type'] == "芝":
         if row['track_condition'] in ["重", "不良"]: condition_mod = +0.15 
@@ -28,30 +26,46 @@ def calculate_early_pace_speed(row, current_dist):
         if row['track_condition'] in ["重", "不良"]: condition_mod = -0.15 
         elif row['track_condition'] == "稍": condition_mod = -0.05
 
-    # 2. 特殊コース・勾配による補正
     course_mod = 0.0
-    # 芝スタートダート
     turf_start_dirt = [("東京", 1600), ("中山", 1200), ("阪神", 1400), ("京都", 1400), ("新潟", 1200), ("中京", 1400)]
     if row['track_type'] == "ダート" and (row['venue'], row['distance']) in turf_start_dirt:
         course_mod += -0.15
         
-    # 上り坂スタート (時計がかかる分を評価)
     uphill_starts = [("中山", 2000, "芝"), ("阪神", 2000, "芝"), ("中京", 2000, "芝")]
     if (row['venue'], row['distance'], row['track_type']) in uphill_starts:
         course_mod += +0.15
 
-    # 下り坂スタート (時計が出やすい分を割引)
     downhill_starts = [("京都", 1400, "芝"), ("京都", 1600, "芝"), ("新潟", 1000, "芝")]
     if (row['venue'], row['distance'], row['track_type']) in downhill_starts:
         course_mod += -0.15
 
-    # 3. 【NEW】距離差による補正
     dist_diff = row['distance'] - current_dist
     clipped_diff = max(-600, min(600, dist_diff))
-    # 100m差につき、秒速 0.08 m/s 分を補正（前走が短距離なら割引、長距離なら加点）
     distance_mod = (clipped_diff / 100.0) * 0.08
 
     return raw_speed + condition_mod + course_mod + distance_mod
+
+# 【NEW】戦法キャラクターの判定（控えOK か ハナ絶対 か）
+def determine_running_style(past_df: pd.DataFrame) -> str:
+    if past_df.empty: return "不明"
+    
+    # ユーザーのアイデアを実装：好走実績の定義（1着 OR (人気 > 着順 AND 着順 <= 5)）
+    is_good_run = (past_df['finish_position'] == 1) | ((past_df['popularity'] > past_df['finish_position']) & (past_df['finish_position'] <= 5))
+    good_runs = past_df[is_good_run]
+    
+    if good_runs.empty: return "不明"
+        
+    good_positions = good_runs['first_corner_pos'].tolist()
+    
+    # 全ての好走が「1番手」なら逃げ一辺倒
+    if all(pos == 1 for pos in good_positions):
+        return "ハナ絶対"
+        
+    # 2〜5番手での好走実績があれば、譲っても競馬ができる
+    if any(2 <= pos <= 5 for pos in good_positions):
+        return "控えOK"
+        
+    return "差し追込"
 
 def extract_jockey_target_position(past_races_df: pd.DataFrame, current_venue: str) -> float:
     if past_races_df.empty: return 7.0 
@@ -75,9 +89,11 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
         horse['condition_mod'] = 0.0
         horse['special_flag'] = ""
         horse['max_early_speed'] = 16.0
+        horse['running_style'] = "不明"
         return 7.0 
     
-    # 距離補正を適用するために current_dist を渡す
+    horse['running_style'] = determine_running_style(past_df)
+    
     past_df['early_speed'] = past_df.apply(lambda row: calculate_early_pace_speed(row, current_dist), axis=1)
     max_speed = past_df['early_speed'].max()
     horse['max_early_speed'] = max_speed if not pd.isna(max_speed) else 16.0
@@ -137,6 +153,7 @@ def format_formation(sorted_horses):
     if backs: parts.append("".join(backs))
     return " ".join(parts)
 
+# 【NEW】キャラクター衝突ベースのペース判定
 def generate_pace_and_spread_comment(sorted_horses, current_track):
     if len(sorted_horses) < 3: return "データ不足"
     
@@ -152,27 +169,30 @@ def generate_pace_and_spread_comment(sorted_horses, current_track):
         spread_reason = "テンが速い馬と遅い馬のスピード差が激しく、ばらけた展開になりそうです。"
     elif spread_gap <= 2.5:
         spread_text = "馬群は【一団】"
-        spread_reason = "各馬の前半スピードが拮抗しており、密集した塊のまま進む展開が濃厚です。コース取り（枠順）の差が出やすくなります。"
+        spread_reason = "各馬の前半スピードが拮抗しており、密集した塊のまま進む展開が濃厚です。コース取りの差が出やすくなります。"
     else:
         spread_text = "【標準的な隊列】"
         spread_reason = "極端にばらけることもなく、標準的なペース配分になりそうです。"
         
     top3_speeds = [h.get('max_early_speed', 16.1) for h in leaders]
     avg_top_speed = sum(top3_speeds) / len(top3_speeds) if top3_speeds else 16.1
-    
     high_pace_threshold = 16.7 if current_track == "芝" else 16.5
     slow_pace_threshold = 16.3 if current_track == "芝" else 16.1
-    
-    if len(leaders) >= 3 and avg_top_speed >= high_pace_threshold:
-        base_cmt = f"🔥 ハイペース想定\n{leader_nums}が激しくハナを主張。テンはかなり速くなりそうです。"
-    elif len(leaders) == 1 and avg_top_speed < slow_pace_threshold:
-        base_cmt = f"🐢 スローペース想定\n{leader_nums}が楽に単騎逃げ。後続は折り合い重視の展開。"
-    elif avg_top_speed >= high_pace_threshold:
-        base_cmt = f"🏃 ややハイペース想定\n{leader_nums}が引っ張る流れ。先行争いは活発です。"
+
+    # ユーザーアイデア：気性・戦法による判定
+    must_lead_count = sum(1 for h in leaders if h.get('running_style') == "ハナ絶対")
+    can_wait_count = sum(1 for h in leaders if h.get('running_style') == "控えOK")
+
+    if must_lead_count >= 2:
+        base_cmt = f"🔥 ハイペース必至\n「何がなんでも逃げたい」馬が複数おり、{leader_nums}の激しい先行争いでテンは速くなりそうです。"
+    elif must_lead_count == 1 and avg_top_speed >= high_pace_threshold:
+        base_cmt = f"🏃 ややハイペース想定\n逃げ主張馬がペースを作り、{leader_nums}が引っ張る淀みない流れになりそうです。"
+    elif must_lead_count == 0 and can_wait_count >= 2:
+        base_cmt = f"🚶 ややスローペース想定\n{leader_nums}が前に行きますが、「控えても結果を出せる」馬たちなので互いに牽制し合い、ペースは落ち着きそうです。"
     elif avg_top_speed < slow_pace_threshold:
-        base_cmt = f"🚶 ややスローペース想定\n{leader_nums}が主導権を握るが、激しく競りかける馬はおらず落ち着きそうです。"
+        base_cmt = f"🐢 スローペース想定\n全体的にテンのダッシュ力が控えめで、{leader_nums}が楽に主導権を握る展開。後続は折り合い重視になりそうです。"
     else:
-        base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行争い。無理のないペース配分です。"
+        base_cmt = f"🐎 平均ペース想定\n{leader_nums}が並んで先行しますが、無理のない標準的なペース配分になりそうです。"
 
     special_alerts = [chr(9311 + h['horse_number']) + " " + h['special_flag'] for h in sorted_horses if h.get('special_flag')]
     
@@ -196,7 +216,7 @@ def fetch_real_data(race_id: str):
         
         basyo_elem = soup.select_one('td.basyo')
         current_venue = basyo_elem.text.strip() if basyo_elem else "不明"
-        if current_venue == "不明": return None, 1600, "", "芝", "出馬表データが見つかりません（未確定の可能性があります）。"
+        if current_venue == "不明": return None, 1600, "", "芝", "出馬表データが見つかりません。"
         
         kyori_elem = soup.select_one('span.kyori')
         course_elem = soup.select_one('span.course')
@@ -238,7 +258,17 @@ def fetch_real_data(race_id: str):
                     elif 'huryo' in src: baba_cond = '不良'
                 
                 early_3f_span = td.select_one('.uzenh3')
-                early_3f = float(early_3f_span.text.strip()) if early_3f_span else np.nan
+                early_3f = np.nan
+                if early_3f_span:
+                    e3f_text = early_3f_span.text.strip()
+                    e3f_match = re.search(r'[\d\.]+', e3f_text)
+                    if e3f_match:
+                        try:
+                            val = float(e3f_match.group())
+                            if 25.0 <= val <= 60.0:
+                                early_3f = val
+                        except:
+                            pass
                 
                 tuka_imgs = td.select('.tuka img')
                 first_corner = 7
@@ -303,8 +333,8 @@ def fetch_real_data(race_id: str):
 # ==========================================
 st.set_page_config(page_title="AI競馬展開予想", page_icon="🏇", layout="centered")
 
-st.title("🏇 AI競馬展開予想 (距離補正・完全版)")
-st.markdown("前走との距離差やコース勾配まで計算に入れた精緻なペース予想を出力します。")
+st.title("🏇 AI競馬展開予想 (気性×絶対スピード版)")
+st.markdown("前走までの「好走パターン」から各馬の戦法をプロファイリングし、リアルな隊列とペースを推測します。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -376,11 +406,12 @@ if races_to_run:
             st.markdown("---")
             st.write(pace_comment)
             
-            with st.expander(f"📊 {race_num}R の詳細スコア"):
+            with st.expander(f"📊 {race_num}R の詳細データを見る"):
                 df_result = pd.DataFrame([{
                     "馬番": h['horse_number'],
                     "馬名": h['horse_name'],
                     "スコア": round(h['score'], 2),
+                    "戦法": h.get('running_style', ''),
                     "特記事項": h.get('special_flag', '')
                 } for h in sorted_horses])
                 st.dataframe(df_result, use_container_width=True, hide_index=True)
