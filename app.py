@@ -50,7 +50,6 @@ def get_frame_modifier(venue, dist, track_type, horse_num, total_horses):
     return base_mod
 
 def check_escape_only_horse(past_df: pd.DataFrame) -> bool:
-    """【改修】逃げ専用機の判定（直近の逃げ能力も加味する）"""
     if past_df.empty: return False
     jra_df = past_df[~past_df['is_local']]
     if jra_df.empty: return False
@@ -65,7 +64,6 @@ def check_escape_only_horse(past_df: pd.DataFrame) -> bool:
         non_escape_success = (non_escape_races['finish_position'] <= 3).any()
         if non_escape_success: return False 
             
-    # 【NEW】直近3走以内に「逃げた（1番手）」実績がないと、今はもう逃げる力がないと判断して弾く
     recent_3_jra = jra_df.head(3)
     if not (recent_3_jra['first_corner_pos'] == 1).any():
         return False
@@ -100,7 +98,6 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
         condition_modifier = 0.0  
     horse['condition_mod'] = condition_modifier 
     
-    # 【改修】逃げ専用機のスコア影響をマイルドに(-1.5)
     is_escape_only = check_escape_only_horse(past_df)
     escape_modifier = -1.5 if is_escape_only else 0.0
     horse['special_flag'] = "🔥逃げ専用(ハナ絶対)" if is_escape_only else ""
@@ -109,17 +106,15 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     return max(1.0, min(18.0, final_score))
 
 def apply_position_synergy(horses):
-    """【改修】隣接枠の競り合いと、内枠逃げ馬の恩恵"""
     horses_sorted = sorted(horses, key=lambda x: x['horse_number'])
     
-    # 1. 同型隣接の競り合い判定 (馬番の差が2以内にある逃げ・先行馬)
+    # 1. 同型隣接の競り合い判定
     for i in range(len(horses_sorted)):
         h1 = horses_sorted[i]
         if h1['score'] <= 3.5: 
             for j in range(i+1, min(i+3, len(horses_sorted))):
                 h2 = horses_sorted[j]
                 if h2['score'] <= 3.5:
-                    # 競り合い発生！両者のスコアを下げて前傾姿勢に
                     h1['score'] -= 0.5
                     h2['score'] -= 0.5
                     h1['synergy'] = "隣接枠と先行争い"
@@ -128,7 +123,6 @@ def apply_position_synergy(horses):
     # 2. 内枠逃げ馬の恩恵
     for i in range(len(horses_sorted)):
         current_score = horses_sorted[i]['score']
-        # 競り合いフラグが立っていない馬にのみ適用
         if 2.5 <= current_score <= 6.0 and not horses_sorted[i]['synergy']:
             inner_horses = horses_sorted[max(0, i-2):i]
             for inner_h in inner_horses:
@@ -161,7 +155,6 @@ def format_formation(sorted_horses):
     return " ".join(parts)
 
 def generate_short_comment(sorted_horses):
-    """【改修】逃げ専用機の単騎逃げや、競り合い状況を加味した短評"""
     if len(sorted_horses) < 2: return "データ不足"
     
     top_score = sorted_horses[0]['score']
@@ -177,7 +170,6 @@ def generate_short_comment(sorted_horses):
 
     escape_only_horses = [h for h in sorted_horses if h.get('special_flag')]
     
-    # 逃げ専用機が1頭だけで、かつトップを走れる形の場合（他馬が譲る）
     if escape_only_horses and len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']:
         base_cmt = f"🐢 スローペース\n逃げ専用の{chr(9311 + escape_only_horses[0]['horse_number'])}がハナを主張。他馬は無理に競りかけず隊列はすんなり決まりそう。"
     elif len(leaders) >= 3: 
@@ -193,7 +185,6 @@ def generate_short_comment(sorted_horses):
     if conflict_text: final_cmt += "\n⚔️ " + conflict_text
     if synergy_text: final_cmt += "\n💡 " + synergy_text
     
-    # 逃げ専用が複数いたり、競り合いになりそうな場合のアラート
     if escape_only_horses and not (len(leaders) == 1 and leaders[0]['horse_number'] == escape_only_horses[0]['horse_number']):
         escape_nums = "、".join([chr(9311 + h['horse_number']) for h in escape_only_horses])
         final_cmt += f"\n⚠️ 何としてもハナを切りたい{escape_nums}の出方次第でさらにペースが上がる可能性も。"
@@ -295,6 +286,9 @@ with st.container(border=True):
     st.subheader("⚙️ レース設定")
     base_url_input = st.text_input("🔗 Yahoo!競馬のURL (どれか1レースでOK)", value="https://sports.yahoo.co.jp/keiba/race/denma/2605010711?detail=1")
     
+    # 【NEW】開催スケジュールへのリンクを追加
+    st.caption("🔍 [開催スケジュールからレースURLを探す（Yahoo!競馬）](https://sports.yahoo.co.jp/keiba/schedule/monthly/)")
+    
     st.markdown("**🎯 予想したいレースを選択（複数可）**")
     
     try:
@@ -348,7 +342,6 @@ if races_to_run:
             for horse in horses:
                 horse['score'] = calculate_pace_score(horse, current_dist, current_venue, current_track, total_horses)
             
-            # 隣接枠の競り合いシナジー適用
             horses = apply_position_synergy(horses)
                 
             sorted_horses = sorted(horses, key=lambda x: x['score'])
